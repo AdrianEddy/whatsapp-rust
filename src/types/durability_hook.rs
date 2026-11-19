@@ -3,7 +3,8 @@
 //! | Origin | Commit gate before ACK/receipt |
 //! | --- | --- |
 //! | Encrypted live/offline direct and group messages | [`InboundDurabilityHook`] |
-//! | Newsletter/channel messages and PDO recovery | No durable capture gate; event-only paths |
+//! | Newsletter/channel messages | [`InboundDurabilityHook`], each as a batch of one |
+//! | PDO recovery | No durable capture gate; event-only path |
 //! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
 //! | Admitted history chunks | [`HistorySyncCaptureHook`], registered separately |
 //! | History notifications with restart recovery | [`crate::HistorySyncDurabilityHook`] |
@@ -18,9 +19,9 @@ use std::sync::Arc;
 pub use wacore::types::events::InboundMessage;
 use waproto::whatsapp as wa;
 
-/// Hook invoked for every decrypted inbound user message before it is
-/// acknowledged to the server, turning the consumer from at-most-once into
-/// at-least-once delivery.
+/// Hook invoked for every decrypted inbound user message, and every newsletter
+/// message, before it is acknowledged to the server, turning the consumer from
+/// at-most-once into at-least-once delivery.
 ///
 /// The transport ack tells the server to drop the message from its offline
 /// queue. By default the SDK acks as soon as a message is decrypted, so a crash
@@ -57,15 +58,30 @@ use waproto::whatsapp as wa;
 /// any reply.
 /// Device metadata lookups for users outside the batch can complete here.
 /// If a lookup requires Signal cleanup or identity recovery, it returns an
-/// error instead of waiting for the hook's own processing permit. Run that
+/// error instead of waiting for the hook's own processing permit (a
+/// newsletter's call, which holds none, is refused the same way). Run that
 /// maintenance from a separate control task and retry the durable batch.
 ///
 /// Scope and known limitations:
-/// - Covers end-to-end encrypted messages (1:1 and group). Newsletter / broadcast
-///   channel messages are not encrypted and are acked on their own path, so the
-///   hook does not gate them (they dispatch event-only). The same applies to PDO
-///   placeholder recoveries (`info.unavailable_request_id` is set): their ack runs
-///   on the PDO path, so the hook never sees them.
+/// - Covers end-to-end encrypted messages (1:1 and group) and newsletter /
+///   broadcast channel messages. PDO placeholder recoveries
+///   (`info.unavailable_request_id` is set) are not gated: their ack runs on the
+///   PDO path, so the hook never sees them.
+/// - A newsletter message (`info.source.chat.is_newsletter()`;
+///   `InboundMessage::newsletter_ref` addresses it) is plaintext and is
+///   committed alone, as a batch of one, live or offline. The ack it is owed
+///   (`<ack class="message">`) follows `Ok`; as for any item, `Err` withholds
+///   both the ack and the event. It skips the pending-inbound buffer, so after
+///   an `Err` its redelivery is parsed again from the stanza. As without a
+///   hook, it also skips the dispatch cache, so a redelivery after a lost ack
+///   reaches this hook and `Event::Messages` again; the idempotence above is
+///   what deduplicates it. Its event says `hook_committed`, so a hook that
+///   returns `Ok` without storing the item leaves that event as its only copy.
+///   The commit runs in its chat lane before any processing permit, so it can
+///   overlap a drain batch's commit, and shutdown and teardown don't wait for
+///   it, as they don't for a live encrypted commit: the ack of an `Ok` that
+///   lands after its connection closed goes out on the next connection, or is
+///   dropped for the server to redeliver.
 /// - Live plaintext backing is admitted before Signal decryption under a
 ///   4 MiB budget and 400 reservations. Admission accounts for both the carrier
 ///   and consumer projection plus metadata; the maximum ciphertext size is
@@ -92,18 +108,20 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// durable; the SDK then acks every message in the batch. Return `Err` to
     /// suppress all their acks and have the server redeliver them.
     ///
-    /// Live messages arrive as batches of one. During the offline drain the
-    /// SDK accumulates and commits per batch (WA Web's MessageProcessorCache
-    /// granularity), so one round-trip covers the lot.
+    /// Live messages and newsletter messages arrive as batches of one. During
+    /// the offline drain the SDK accumulates encrypted messages and commits
+    /// them per batch (WA Web's MessageProcessorCache granularity), so one
+    /// round-trip covers the lot.
     /// [`Event::Messages`](wacore::types::events::Event::Messages) then
     /// carries the exact same items: what this method committed is what event
     /// consumers observe. Publication precedes conditional pending-row cleanup
     /// so a partial cleanup cannot discard part of this committed event. ACK
     /// waits for the complete cleanup; an error or cancellation can therefore
     /// leave rows to retry after the event has already been published. The
-    /// existing dispatch cache suppresses repeated events within its retention
-    /// window, including reconnects of the same Client. A process restart still
-    /// requires the idempotent durable consumer described above.
+    /// existing dispatch cache suppresses repeated events of encrypted messages
+    /// within its retention window, including reconnects of the same Client. A
+    /// process restart still requires the idempotent durable consumer described
+    /// above.
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
 }
 

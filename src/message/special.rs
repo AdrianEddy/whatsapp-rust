@@ -28,6 +28,7 @@ impl Client {
                 info.id,
                 node.tag
             );
+            self.ack_undispatched_newsletter(node).await;
             return;
         };
 
@@ -39,13 +40,14 @@ impl Client {
                         info.id,
                         info.source.chat.observe()
                     );
-                    self.dispatch_parsed_message(msg, info, false).await;
+                    self.dispatch_newsletter_message(msg, info, node).await;
                 }
                 Err(e) => {
                     log::warn!(
                         "[msg:{}] Failed to decode newsletter plaintext: {e}",
                         info.id
                     );
+                    self.ack_undispatched_newsletter(node).await;
                 }
             }
         } else {
@@ -54,6 +56,17 @@ impl Client {
                 info.id,
                 info.source.chat.observe()
             );
+            self.ack_undispatched_newsletter(node).await;
+        }
+    }
+
+    /// A newsletter stanza with nothing to commit or publish keeps the ack the
+    /// `should_ack` gate gives it, since a redelivery would decode no better.
+    /// With an inbound durability hook the gate left that ack to the commit,
+    /// so it is sent here.
+    async fn ack_undispatched_newsletter(self: &Arc<Self>, node: &NodeRef<'_>) {
+        if self.ack_follows_inbound_commit(node) {
+            self.spawn_node_transport_ack(node).await;
         }
     }
 

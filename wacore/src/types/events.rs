@@ -1066,10 +1066,11 @@ pub enum Event {
     /// With a hook registered this event is at-least-once, like the hook: a
     /// redelivery whose buffered copy survived (e.g. the post-commit cleanup
     /// failed and the ack was lost) replays through the same commit and
-    /// dispatches again. Exceptions that bypass the hook: newsletter
-    /// messages (plaintext, acked on their own path, never redelivered) and
-    /// PDO placeholder recoveries (identified by
-    /// `info.unavailable_request_id`) dispatch event-only.
+    /// dispatches again. Newsletter messages go through the hook as batches
+    /// of one but bypass the commit batcher and the `dispatched_messages`
+    /// window, so a redelivery after a lost ack dispatches again. PDO
+    /// placeholder recoveries (identified by `info.unavailable_request_id`)
+    /// bypass the hook and dispatch event-only.
     ///
     /// A sender retrying its own outbox resends one message re-encrypted, which
     /// no ratchet can see as a duplicate. Such a resend collapses to a single
@@ -1567,9 +1568,10 @@ pub struct MessageBatch {
     /// rewriting every row (and re-firing every invalidation) a second time.
     ///
     /// `false` for the producers that dispatch `Event::Messages` while
-    /// deliberately bypassing the commit pipeline — newsletters and
-    /// PDO-recovered messages — because for those the materialization on this
-    /// event is the only one there is.
+    /// deliberately bypassing the commit pipeline — PDO-recovered messages,
+    /// and newsletters while no hook is registered — because for those the
+    /// materialization on this event is the only one there is. With a hook a
+    /// newsletter message is committed alone before its event, which says so.
     #[builder(default)]
     pub hook_committed: bool,
 }

@@ -323,6 +323,7 @@ impl Client {
     }
 
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
+    #[cfg(test)]
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_parsed_message(
         self: &Arc<Self>,
@@ -356,6 +357,7 @@ impl Client {
 
     /// Dispatch an already-shared plaintext, reusing any envelope the duplicate
     /// probe materialized instead of resolving the parent secret a second time.
+    #[cfg(test)]
     pub(crate) async fn dispatch_shared_message_with_decrypted(
         self: &Arc<Self>,
         msg: Arc<wa::Message>,
@@ -386,19 +388,11 @@ impl Client {
             Option<Arc<live_retention::ReceiptScope>>,
         ),
     ) -> InboundCommitState {
+        wacore::telemetry::recv("decrypted");
+        self.stats.record_message_received();
         let item = self
             .prepare_shared_inbound_message(msg, info, pre_decrypted)
             .await;
-        // Newsletters were already transport-acked before the processing permit.
-        if info.source.chat.is_newsletter() {
-            self.core.event_bus.dispatch(Event::Messages(
-                wacore::types::events::MessageBatch::builder()
-                    .messages(Arc::from([item]))
-                    .origin(wacore::types::events::BatchOrigin::Live)
-                    .build(),
-            ));
-            return InboundCommitState::Durable;
-        }
         self.commit_or_batch_pending(
             raw_pending::PendingDelivery {
                 item,
@@ -414,6 +408,68 @@ impl Client {
         .await
     }
 
+    /// Publish one newsletter delivery. Newsletters are plaintext and bypass
+    /// the commit batcher: nothing is journaled and no Signal state moves, so a
+    /// redelivery is parsed again from its stanza.
+    ///
+    /// Without an inbound durability hook the `should_ack` gate queues the
+    /// stanza's ack as soon as the stanza is queued on its chat lane, whatever
+    /// the lane then does with it, so only the event is left here. With one,
+    /// the hook commits the delivery as a batch of one; then the ack the gate
+    /// left here ([`Self::ack_follows_inbound_commit`]), encoded from `stanza`
+    /// (the bytes the gate would have sent), goes to
+    /// `spawn_node_transport_ack`, and only then is the event published, marked
+    /// `hook_committed`. So the ack is never sent before the commit and is
+    /// handed off before any consumer code on the bus runs, but its frame may
+    /// reach the transport only after that code has run. A hook error sends
+    /// nothing, neither the ack nor the event: the delivery stays
+    /// unacknowledged for the server to send again.
+    ///
+    /// The gate decides from the stanza's `from` who owes the ack, so this asks
+    /// it rather than the parsed chat: an own-device echo whose `recipient` is
+    /// a channel parses to that channel, but the gate owed it nothing, so it is
+    /// committed and published and gets no answer, as without a hook.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
+    pub(super) async fn dispatch_newsletter_message(
+        self: &Arc<Self>,
+        msg: wa::Message,
+        info: &Arc<MessageInfo>,
+        stanza: &NodeRef<'_>,
+    ) {
+        let item = self
+            .prepare_shared_inbound_message(Arc::new(msg), info, None)
+            .await;
+        let hook_committed = if let Some(hook) = self.inbound_durability_hook() {
+            if let Err(error) = self
+                .call_inbound_hook(hook.as_ref(), std::slice::from_ref(&item))
+                .await
+            {
+                log::warn!(
+                    "[msg:{}] Inbound durability hook failed for a newsletter message; withholding its ack for redelivery: {error:?}",
+                    info.id
+                );
+                return;
+            }
+            if self.ack_follows_inbound_commit(stanza) {
+                self.spawn_node_transport_ack(stanza).await;
+            }
+            true
+        } else {
+            false
+        };
+        // Counted when published, so a delivery the hook refused counts once,
+        // on the redelivery it commits.
+        wacore::telemetry::recv("decrypted");
+        self.stats.record_message_received();
+        self.core.event_bus.dispatch(Event::Messages(
+            wacore::types::events::MessageBatch::builder()
+                .messages(Arc::from([item]))
+                .origin(wacore::types::events::BatchOrigin::Live)
+                .hook_committed(hook_committed)
+                .build(),
+        ));
+    }
+
     /// Prepare the consumer projection before entering the existing commit path.
     pub(crate) async fn prepare_shared_inbound_message(
         self: &Arc<Self>,
@@ -422,8 +478,6 @@ impl Client {
         pre_decrypted: Option<Arc<wa::Message>>,
     ) -> wacore::types::events::InboundMessage {
         use wacore::proto_helpers::MessageExt;
-        wacore::telemetry::recv("decrypted");
-        self.stats.record_message_received();
 
         // Both ride on the `InboundMessage`, not the shared `MessageInfo`:
         // writing them into the `Arc` every `<enc>` of the stanza holds
@@ -621,6 +675,9 @@ impl Client {
         tx
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

@@ -44,6 +44,24 @@ impl Client {
         );
         Ok(())
     }
+
+    /// `hook.on_messages(batch)`, with this client marked as inside its inbound
+    /// hook for every poll, so the Signal maintenance the hook reaches refuses
+    /// ([`Self::ensure_signal_maintenance_context`]) on every path that commits.
+    pub(super) fn call_inbound_hook<'a>(
+        self: &'a Arc<Self>,
+        hook: &'a dyn crate::types::durability_hook::InboundDurabilityHook,
+        batch: &'a [InboundMessage],
+    ) -> impl Future<Output = anyhow::Result<()>> + 'a {
+        let client = std::ptr::from_ref(self.as_ref()) as usize;
+        let mut hook_future = hook.on_messages(Arc::clone(self), batch);
+        std::future::poll_fn(move |cx| {
+            let previous = INBOUND_HOOK_CLIENT.replace(Some(client));
+            let _restore =
+                scopeguard::guard(previous, |previous| INBOUND_HOOK_CLIENT.set(previous));
+            hook_future.as_mut().poll(cx)
+        })
+    }
 }
 
 #[derive(Default)]
@@ -1879,15 +1897,7 @@ impl Client {
             if !items.is_empty()
                 && let Some(hook) = self.inbound_durability_hook()
             {
-                let mut hook_future = std::pin::pin!(hook.on_messages(self.clone(), &items));
-                let result = std::future::poll_fn(|cx| {
-                    let previous = INBOUND_HOOK_CLIENT
-                        .replace(Some(std::ptr::from_ref(self.as_ref()) as usize));
-                    let _restore =
-                        scopeguard::guard(previous, |previous| INBOUND_HOOK_CLIENT.set(previous));
-                    hook_future.as_mut().poll(cx)
-                })
-                .await;
+                let result = self.call_inbound_hook(hook.as_ref(), &items).await;
                 if let Err(e) = result {
                     log::warn!(
                         "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",

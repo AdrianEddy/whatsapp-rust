@@ -879,11 +879,13 @@ impl Client {
         // Move those nodes into their chat lane instead of retaining a second
         // Arc in this dispatcher while decryption starts. Besides removing an
         // atomic refcount pair, this lets a large uniquely-owned pkmsg donate
-        // its receive buffer to authenticated in-place decryption. Newsletter
-        // and status messages keep the extra owner until their deferred ack is
-        // encoded, preserving the existing acknowledgement semantics.
+        // its receive buffer to authenticated in-place decryption. Status
+        // messages, and newsletter messages whose ack does not wait for an
+        // inbound durability hook, keep the extra owner until their deferred
+        // ack is encoded, preserving the existing acknowledgement semantics.
         let should_ack = self.should_ack(nr);
-        let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
+        let deferred_ack_node =
+            (should_ack && !self.ack_follows_inbound_commit(nr)).then(|| Arc::clone(&node));
 
         // A claimed group notification still owes an ACK, so persistence must
         // precede both interceptors and the built-in group effects.
@@ -918,14 +920,18 @@ impl Client {
             // draws an <iq type="result">, and a generic <ack class="message">
             // is neither. Inventing one is worse than silence — whoever claimed
             // the stanza took on the reply. The tags `should_ack` covers are
-            // unaffected; they were already answered above.
+            // unaffected; they were already answered above, or, for a
+            // newsletter delivery whose ack waits for the inbound durability
+            // hook, are answered here: the claim takes it past the commit that
+            // would have sent that ack.
             //
             // Same identity requirement as the nack path: without `id` and
             // `from` there is nothing to address.
             let ack = deferred_ack_node.or_else(|| {
-                (!self.stanza_router.models(nr.tag.as_ref())
-                    && nr.get_attr("id").is_some()
-                    && nr.get_attr("from").is_some())
+                (should_ack
+                    || (!self.stanza_router.models(nr.tag.as_ref())
+                        && nr.get_attr("id").is_some()
+                        && nr.get_attr("from").is_some()))
                 .then(|| Arc::clone(&node))
             });
             if !shutdown.is_fired()
@@ -1128,6 +1134,21 @@ impl Client {
             Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
             _ => false,
         }
+    }
+
+    /// Whether a stanza [`Self::should_ack`] covers leaves its ack to a durable
+    /// commit instead of the gate: a newsletter `<message>` while an
+    /// [`InboundDurabilityHook`](crate::types::durability_hook::InboundDurabilityHook)
+    /// is registered. The gate acks without waiting for the delivery to be
+    /// parsed, so a delivery the hook refused, or one lost to a crash or a
+    /// reconnect before the hook ran, would be gone from the server's queue;
+    /// `dispatch_newsletter_message` sends the same ack once the hook has
+    /// committed the delivery. status@broadcast keeps the gate, which its drop
+    /// paths rely on.
+    pub(crate) fn ack_follows_inbound_commit(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        self.inbound_durability_hook.get().is_some()
+            && node.tag.as_ref() == StanzaTag::Message.as_str()
+            && from_jid_matches(node, |jid| jid.is_newsletter())
     }
 
     /// Possibly send a deferred ack: either immediately or through the ack
