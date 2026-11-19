@@ -9,11 +9,25 @@ repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Tokio-based WebSocket transport for whatsapp-rust"
 
 [features]
-default = []
+default = ["tls"]
+# The transport's own dialer: `TokioWebSocketTransportFactory` and
+# `default_tls_connector`, which dial, run TLS (rustls on ring, trusting
+# webpki-roots) and the WebSocket upgrade. A host that dials and upgrades
+# itself turns default features off and frames its stream with
+# `from_upgraded_stream` or `from_websocket`: no TLS stack is built then, and
+# nothing installs a process-wide rustls provider.
+tls = [
+    "dep:http",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+    "tokio-websockets/ring",
+    "tokio-websockets/rustls-bring-your-own-connector",
+]
 # Raw byte streams; Noise and WhatsApp framing remain in wacore.
 tcp = ["tokio/net", "tokio/io-util"]
 # Skip TLS certificate verification (for testing with mock servers)
-danger-skip-tls-verify = []
+danger-skip-tls-verify = ["tls"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -21,24 +35,30 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "alloc", "std"] }
-http = "1.5.0"
+http = { version = "1.5.0", optional = true }
 log = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
-tokio-websockets = { version = "0.13.3", features = [
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"], optional = true }
+# No TLS backend here (`tls` adds one). The client half needs a SHA-1 backend
+# to compile (tokio-websockets' `lib.rs`), so `sha1_smol` is it until `tls`
+# brings `ring`; `rand` masks the frames.
+tokio-websockets = { version = "0.13.3", default-features = false, features = [
     "client",
-    "rustls-bring-your-own-connector",
     "rand",
-    "ring",
+    "sha1_smol",
 ] }
 wacore = { workspace = true }
-webpki-roots = "1.0.10"
+webpki-roots = { version = "1.0.10", optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
 tokio-websockets = { version = "0.13.3", features = ["server"] }
+
+[[test]]
+name = "dialer"
+required-features = ["tls"]
 
 [lints]
 workspace = true

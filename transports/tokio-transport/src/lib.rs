@@ -1,38 +1,48 @@
 //! Tokio WebSocket transport for whatsapp-rust.
 //!
-//! For custom byte streams (including proxy tunnels), use
-//! [`TokioWebSocketTransportFactory::with_dialer`]. For already-upgraded sockets,
-//! use [`from_websocket`]. This transport requires a native Tokio runtime; it
-//! does not support browser WASM.
+#![cfg_attr(
+    feature = "tls",
+    doc = "For custom byte streams (including proxy tunnels), use [`TokioWebSocketTransportFactory::with_dialer`]."
+)]
+//! For already-upgraded sockets, use [`from_websocket`], or
+//! [`from_upgraded_stream`] when the caller performed the HTTP upgrade itself.
+//! This transport requires a native Tokio runtime; it does not support browser
+//! WASM.
 
 #[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(feature = "tcp")]
 pub use tcp::{TokioTcpTransportFactory, from_byte_stream};
 
+#[cfg(feature = "tls")]
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+#[cfg(feature = "tls")]
+use std::sync::Once;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
-use wacore::net::{
-    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_ORIGIN,
-    WHATSAPP_WEB_WS_URL,
-};
+use wacore::net::{DisconnectReason, Transport, TransportEvent};
+#[cfg(feature = "tls")]
+use wacore::net::{TransportFactory, WHATSAPP_WEB_ORIGIN, WHATSAPP_WEB_WS_URL};
 
+#[cfg(feature = "tls")]
 pub use tokio_websockets::Connector;
 
 /// A connected byte stream on which the factory performs TLS and WebSocket upgrade.
+#[cfg(any(feature = "tls", feature = "tcp"))]
 pub trait DialStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
+#[cfg(any(feature = "tls", feature = "tcp"))]
 impl<S: AsyncRead + AsyncWrite + Send + Unpin> DialStream for S {}
 
 /// Type-erased stream returned by a [`StreamDialer`].
+#[cfg(any(feature = "tls", feature = "tcp"))]
 pub type BoxedStream = Box<dyn DialStream>;
 
 /// Supplies a connected, unencrypted byte stream, without a WebSocket upgrade.
@@ -45,6 +55,7 @@ pub type BoxedStream = Box<dyn DialStream>;
 /// The future is awaited inline, inside the client's existing transport timeout.
 /// Cancellation drops it (and any stream it owns); implementations must not leave
 /// detached connection tasks running. Errors retain their source chain.
+#[cfg(any(feature = "tls", feature = "tcp"))]
 #[async_trait]
 pub trait StreamDialer: Send + Sync {
     async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, anyhow::Error>;
@@ -73,14 +84,17 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
     }
 }
 
+#[cfg(feature = "tls")]
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 /// rustls 0.23.43 divides this budget by eight to size its server-name queue,
 /// then evicts when the queue reaches capacity. Two slots retain one name;
 /// one slot immediately evicts it. The per-server TLS 1.3 ticket limit stays eight.
+#[cfg(feature = "tls")]
 const RESUMPTION_TICKETS: usize = 16;
 
 /// Applies the single-host resumption sizing to a freshly built config.
+#[cfg(feature = "tls")]
 fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
     config.resumption = rustls::client::Resumption::in_memory_sessions(RESUMPTION_TICKETS);
     config
@@ -98,6 +112,7 @@ fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
 ///
 /// On first call, installs `ring` as the global rustls crypto provider
 /// (no-op if one is already installed).
+#[cfg(feature = "tls")]
 pub fn default_tls_connector() -> Connector {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -243,16 +258,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for WsTranspo
 /// Reads at or above this size are moved out of the WebSocket codec's buffer
 /// into their own allocation before handoff.
 ///
-/// tokio-websockets cuts each message out of its long-lived read buffer
-/// (`BytesMut::split_to`, which always promotes the buffer to shared), so the
-/// `Bytes` inside a message is a shared view into it: `FrameDecoder::feed_owned`
+/// tokio-websockets cuts each unfragmented message out of its long-lived read
+/// buffer (`BytesMut::split_to`, which always promotes the buffer to shared), so
+/// the message's `Bytes` is a shared view into it: `FrameDecoder::feed_owned`
 /// could never adopt such a read (`Bytes::try_into_mut` fails while the codec
 /// holds the other reference) and would copy every large frame anyway, while
 /// the view kept the codec's whole read buffer — and any frames coalesced into
 /// it — alive until the read loop got around to that copy. Moving a large read
 /// into its own `Vec` hands the decoder a uniquely-owned buffer it adopts with
 /// no further copy, and drops the shared view here so the codec reuses its
-/// buffer for the next read.
+/// buffer for the next read. A fragmented message needs no move:
+/// tokio-websockets reassembles it into a buffer of its own, which the decoder
+/// adopts as is.
 ///
 /// Reads below this size keep the zero-copy shared handoff: the decoder copies
 /// those into its amortized chunk buffer regardless, so a `Vec` here would add
@@ -265,14 +282,17 @@ const ADOPT_THRESHOLD: usize = 1024;
 
 /// Moves a received message's payload into the `Bytes` handed to the read loop.
 ///
-/// Large reads get their own allocation (adoptable by `feed_owned`); small
-/// reads keep the zero-copy shared view (copied into the decoder's chunk
-/// buffer regardless). Rationale on [`ADOPT_THRESHOLD`].
+/// Large reads that share their buffer get their own allocation, and large
+/// reads that already own one pass as they are: either way `feed_owned` adopts
+/// them. Small reads keep the zero-copy shared view (copied into the decoder's
+/// chunk buffer regardless). Rationale on [`ADOPT_THRESHOLD`].
 fn handoff_bytes(payload: tokio_websockets::Payload) -> Bytes {
-    if payload.len() >= ADOPT_THRESHOLD {
-        Bytes::from(payload.to_vec())
+    let bytes = Bytes::from(payload);
+    // `is_unique` is the test `feed_owned`'s `try_into_mut` makes.
+    if bytes.len() >= ADOPT_THRESHOLD && !bytes.is_unique() {
+        Bytes::copy_from_slice(&bytes)
     } else {
-        Bytes::from(payload)
+        bytes
     }
 }
 
@@ -340,9 +360,16 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 /// Wraps an already-upgraded [`WebSocketStream`] into a [`Transport`] + event channel.
 ///
-/// For custom dialing (e.g. proxy tunnels, IPv4 preference, TCP keepalive), prefer
-/// [`TokioWebSocketTransportFactory::with_dialer`] to retain the canonical upgrade.
-/// This function remains available when the caller intentionally owns the upgrade.
+#[cfg_attr(
+    feature = "tls",
+    doc = "For custom dialing (e.g. proxy tunnels, IPv4 preference, TCP keepalive), prefer"
+)]
+#[cfg_attr(
+    feature = "tls",
+    doc = "[`TokioWebSocketTransportFactory::with_dialer`] to retain the canonical upgrade."
+)]
+/// Use this function when the caller owns the upgrade;
+/// [`from_upgraded_stream`] does the same without naming a tokio-websockets type.
 pub fn from_websocket<S>(
     ws: WebSocketStream<S>,
 ) -> (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)
@@ -363,10 +390,36 @@ where
     (transport, event_rx)
 }
 
+/// Frames a stream on which the caller has already completed the WebSocket
+/// upgrade, as the client end, into a [`Transport`] + event channel.
+///
+/// The caller owns everything before the first frame: the dial, TLS, the
+/// HTTP/1.1 upgrade request and the check of its `101 Switching Protocols`
+/// response (status and `Sec-WebSocket-Accept`). The stream must start at the
+/// server's first frame byte, so bytes the caller read past the response head
+/// are the stream's first bytes. Nothing is negotiated here: frames carry no
+/// extension, so a response that accepted one (`permessage-deflate`) must be
+/// refused before this point. Frames use tokio-websockets' default
+/// configuration and limits.
+///
+/// Equivalent to [`from_websocket`] over tokio-websockets' `take_over`, but the
+/// caller names no tokio-websockets type, so the framing crate's version stays
+/// this crate's concern. Like [`from_websocket`], it spawns the read task on the
+/// current Tokio runtime.
+pub fn from_upgraded_stream<S>(
+    stream: S,
+) -> (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    from_websocket(ClientBuilder::new().take_over(stream))
+}
+
 /// Default [`TransportFactory`] using system DNS, TCP, and TLS.
 ///
 /// Use [`Self::with_dialer`] to replace only the connection step while retaining
 /// TLS configuration, resumption, and the canonical WebSocket upgrade.
+#[cfg(feature = "tls")]
 pub struct TokioWebSocketTransportFactory {
     url: String,
     connector: Option<Connector>,
@@ -378,6 +431,7 @@ pub struct TokioWebSocketTransportFactory {
     dialer: Option<Arc<dyn StreamDialer>>,
 }
 
+#[cfg(feature = "tls")]
 impl TokioWebSocketTransportFactory {
     pub fn new() -> Self {
         Self {
@@ -485,12 +539,14 @@ impl TokioWebSocketTransportFactory {
     }
 }
 
+#[cfg(feature = "tls")]
 impl Default for TokioWebSocketTransportFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "tls")]
 #[async_trait]
 impl TransportFactory for TokioWebSocketTransportFactory {
     async fn create_transport(
@@ -540,6 +596,7 @@ impl TransportFactory for TokioWebSocketTransportFactory {
     }
 }
 
+#[cfg(feature = "tls")]
 fn dial_destination(uri: &http::Uri) -> anyhow::Result<(String, u16)> {
     let authority = uri
         .authority()
@@ -581,6 +638,7 @@ fn dial_destination(uri: &http::Uri) -> anyhow::Result<(String, u16)> {
     ))
 }
 
+#[cfg(feature = "tls")]
 fn connect_error(error: tokio_websockets::Error) -> anyhow::Error {
     let message = format!("WebSocket connect failed: {error}");
     anyhow::Error::new(error).context(message)
@@ -591,8 +649,8 @@ mod tests {
     use super::*;
 
     /// A large read must reach the frame decoder as a uniquely-owned `Bytes`
-    /// or `feed_owned` cannot adopt it. The production input is always shared
-    /// (the codec cuts messages out of its read buffer via `split_to`), so
+    /// or `feed_owned` cannot adopt it. An unfragmented message is always
+    /// shared (the codec cuts it out of its read buffer via `split_to`), so
     /// this feeds the handoff a clone-held payload — the shape that must still
     /// come out unique — and asserts adoption-ability by pointer semantics:
     /// `try_into_mut` succeeds only for a single owner.
@@ -608,6 +666,38 @@ mod tests {
 
         let bytes = handoff_bytes(shared);
         assert_eq!(&bytes[..], &backing[..]);
+        assert!(
+            bytes.try_into_mut().is_ok(),
+            "a large read must be adoptable by feed_owned"
+        );
+    }
+
+    /// A fragmented message arrives uniquely owned, and the handoff must pass
+    /// its buffer on as is rather than copy it a second time. The payload is
+    /// built as tokio-websockets 0.13.3 reassembles one (`proto/stream.rs`):
+    /// the first fragment, a shared view of the read buffer, copied into a
+    /// `BytesMut` of its own, the rest appended, then frozen.
+    #[test]
+    fn large_unique_reads_hand_over_without_a_copy() {
+        let read_buffer = Bytes::from(vec![0xC3u8; ADOPT_THRESHOLD * 2]);
+        // `clone` keeps a second owner alive, as the codec's read buffer does.
+        let first = tokio_websockets::Payload::from(read_buffer.clone());
+        let mut partial = bytes::BytesMut::from(first);
+        partial.extend_from_slice(&[0x3Cu8; ADOPT_THRESHOLD * 2]);
+        let reassembled = partial.freeze();
+        assert!(
+            reassembled.is_unique(),
+            "test setup must be unique to mean anything"
+        );
+        let (ptr, len) = (reassembled.as_ptr(), reassembled.len());
+
+        let bytes = handoff_bytes(tokio_websockets::Payload::from(reassembled));
+        assert_eq!(
+            (bytes.as_ptr(), bytes.len()),
+            (ptr, len),
+            "a uniquely-owned large read must not be copied"
+        );
+        assert_eq!(&bytes[..read_buffer.len()], &read_buffer[..]);
         assert!(
             bytes.try_into_mut().is_ok(),
             "a large read must be adoptable by feed_owned"
@@ -643,6 +733,12 @@ mod tests {
             EST_READ_BUFFER_BYTES + EST_WRITE_BUFFER_BYTES + EST_TLS_STATE_BYTES
         );
     }
+}
+
+/// The factory's tests: its dials, default connector and TLS sessions.
+#[cfg(all(test, feature = "tls"))]
+mod factory_tests {
+    use super::*;
 
     struct TcpDialer;
 
