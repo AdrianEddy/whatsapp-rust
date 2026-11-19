@@ -17529,7 +17529,8 @@ mod pdo_alias_tests {
                 message_texts_for_id(&events, ID),
                 ["alias payload", "ordinary part B"]
             );
-            assert_eq!(hook.0.load(Ordering::Relaxed), usize::from(durable));
+            // The hook commits the recovery and the distinct part once each.
+            assert_eq!(hook.0.load(Ordering::Relaxed), 2 * usize::from(durable));
         }
     }
 
@@ -18420,6 +18421,8 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
     struct Hook {
         calls: std::sync::atomic::AtomicUsize,
         skdm: std::sync::atomic::AtomicUsize,
+        /// Items that are the phone's recovery rather than a retry.
+        recovered: std::sync::atomic::AtomicUsize,
     }
     #[async_trait::async_trait]
     impl crate::types::durability_hook::InboundDurabilityHook for Hook {
@@ -18435,6 +18438,9 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 if message.message.sender_key_distribution_message.is_set() {
                     self.skdm.fetch_add(1, Ordering::Relaxed);
+                }
+                if message.info.unavailable_request_id.is_some() {
+                    self.recovered.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Ok(())
@@ -18810,15 +18816,33 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                     .any(|m| m.conversation.as_deref() == Some("synthetic ping"))
             );
             if with_hook {
+                let calls = hook.calls.load(Ordering::Relaxed);
+                let recovered = hook.recovered.load(Ordering::Relaxed);
                 assert_eq!(
-                    hook.calls.load(Ordering::Relaxed),
+                    calls,
                     if variant < 2 { 1 } else { 2 },
                     "hook calls: variant={variant}, offline={offline}, with_pdo={with_pdo}, order={order:?}"
                 );
+                // The hook commits whichever copy of the payload comes first:
+                // the phone's recovery (the stored user payload, no SKDM) or a
+                // retry. The recovery is first when its leg runs first, and
+                // offline also when the retries before it still wait in the
+                // drain's batch, which holds unless the batch's flush timer
+                // committed them already: there only the bound is checked.
+                let recovery_first = with_pdo && order[0] == 0;
+                if offline && with_pdo && !recovery_first {
+                    assert!(recovered <= 1, "one recovery at most: order={order:?}");
+                } else {
+                    assert_eq!(
+                        recovered,
+                        usize::from(recovery_first),
+                        "recovered copies: variant={variant}, offline={offline}, with_pdo={with_pdo}, order={order:?}"
+                    );
+                }
                 assert_eq!(
-                    hook.skdm.load(Ordering::Relaxed) != 0,
-                    variant != 0,
-                    "the hook must receive the unmodified SKDM carrier"
+                    hook.skdm.load(Ordering::Relaxed),
+                    if variant != 0 { calls - recovered } else { 0 },
+                    "every retry copy the hook receives carries its SKDM carrier unmodified"
                 );
             }
             match variant {
@@ -18962,9 +18986,26 @@ async fn pdo_retry_overlaps_durability_commit() {
         !fixture.client.message_already_dispatched(&info).await,
         "an uncommitted message must not be claimed"
     );
-    fixture.recover().await;
-    release.send(()).await.unwrap();
+    // The recovery commits through the hook too, so it waits beside the
+    // retry's commit, and neither is claimed before its own commit returns.
+    let client = fixture.client.clone();
+    let response = fixture.response.clone();
+    let phone_info = fixture.phone_info.clone();
+    let recovering =
+        tokio::spawn(async move { client.handle_pdo_response(&response, &phone_info).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !fixture.client.message_already_dispatched(&info).await,
+        "an uncommitted recovery must not be claimed either"
+    );
+    for _ in 0..2 {
+        release.send(()).await.unwrap();
+    }
     receiving.await.unwrap();
+    recovering.await.unwrap();
     fixture.recover().await;
     fixture.assert_once();
 }
@@ -19340,15 +19381,15 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
     fixture.recover().await;
     assert_eq!(
         hook.calls.load(Ordering::Relaxed),
-        0,
-        "PDO remains event-only"
+        1,
+        "the recovery commits through the hook before its event"
     );
     fixture.retry().await;
     crate::test_utils::wait_for_outbound_tasks(&fixture.client).await;
     assert_eq!(
         hook.calls.load(Ordering::Relaxed),
-        1,
-        "an event-only recovery must not bypass the retry's durability hook"
+        if fail_first { 2 } else { 1 },
+        "a retry repeats a committed recovery, but must still commit after a refused one"
     );
     let info = Arc::new(
         fixture
@@ -19375,11 +19416,18 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
         fixture.retry().await;
         assert_eq!(
             hook.calls.load(Ordering::Relaxed),
-            2,
+            3,
             "ratchet duplicate must replay the buffered hook failure"
         );
     }
     assert!(pending().await.unwrap().is_none());
+    // A refused recovery claims nothing, so the replayed retry is the
+    // ordinary delivery; a committed one is claimed as committed.
+    let committed = if fail_first {
+        MessageDispatch::Decrypted
+    } else {
+        MessageDispatch::RecoveredCommitted
+    };
     assert!(
         fixture
             .client
@@ -19388,8 +19436,8 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
             .is_some_and(|claim| claim
                 .payloads
                 .first()
-                .is_some_and(|payload| payload.state == MessageDispatch::RecoveredCommitted)),
-        "promotion records hook success for the PDO event that was already published"
+                .is_some_and(|payload| payload.state == committed)),
+        "the claim records the copy whose commit published the message"
     );
     fixture
         .client
@@ -19409,7 +19457,7 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
         .unwrap();
     assert_eq!(
         hook.calls.load(Ordering::Relaxed),
-        if fail_first { 2 } else { 1 },
+        if fail_first { 3 } else { 1 },
         "a fresh resend after hook success must not recommit"
     );
     fixture.recover().await;
@@ -19424,6 +19472,367 @@ async fn pdo_retry_recovered_event_still_requires_durable_commit() {
 #[tokio::test]
 async fn pdo_retry_recovered_event_preserves_failed_hook_replay() {
     pdo_retry_durability_after_recovery(true).await;
+}
+
+/// WF2, through the whole receive path: a recovery the hook refuses fails the
+/// phone's reply that carries it. The reply is neither committed nor acked and
+/// the phone is not asked again; its plaintext stays retained and its request
+/// pending, so the server's redelivery of the reply replays it, the recovery is
+/// committed and published once, and only then is the reply committed and
+/// acked.
+#[tokio::test]
+async fn pdo_refused_recovery_fails_its_reply() {
+    /// Each item's stanza id and whether it is a recovery, in call order; the
+    /// first call is refused.
+    #[derive(Default)]
+    struct RefuseFirst(std::sync::Mutex<Vec<(String, bool)>>);
+
+    #[async_trait::async_trait]
+    impl crate::types::durability_hook::InboundDurabilityHook for RefuseFirst {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            messages: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            let mut calls = self.0.lock().unwrap();
+            let first = calls.is_empty();
+            calls.extend(messages.iter().map(|message| {
+                (
+                    message.info.id.as_str().to_owned(),
+                    message.info.unavailable_request_id.is_some(),
+                )
+            }));
+            anyhow::ensure!(!first, "synthetic refusal of the first commit");
+            Ok(())
+        }
+    }
+
+    const REPLY_ID: &str = "SYNTHETIC_PDO_RESPONSE";
+    let fixture = PdoRetryFixture::new().await;
+    let hook = Arc::new(RefuseFirst::default());
+    fixture
+        .client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group = fixture
+        .client
+        .parse_message_info(fixture.retry.get())
+        .await
+        .unwrap()
+        .source
+        .chat;
+    let pending_key = wacore::types::message::ChatMessageId::new(group, PdoRetryFixture::ID.into());
+    /// Whether each published batch holding the recovery was hook-committed.
+    fn recovered(events: &[Arc<Event>]) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|event| match event.as_ref() {
+                Event::Messages(batch) => Some(batch),
+                _ => None,
+            })
+            .filter(|batch| {
+                batch
+                    .messages
+                    .iter()
+                    .any(|message| message.info.id == PdoRetryFixture::ID)
+            })
+            .map(|batch| batch.hook_committed)
+            .collect()
+    }
+    let phone = "777000000000001@lid";
+    let start = fixture.transport.sent().len();
+
+    fixture
+        .client
+        .clone()
+        .handle_incoming_message(fixture.phone_response.clone())
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&fixture.client).await;
+    assert_eq!(
+        *hook.0.lock().unwrap(),
+        [(PdoRetryFixture::ID.to_owned(), true)],
+        "the recovery reaches the hook, which refuses it; the reply never does"
+    );
+    let events: Vec<_> = std::iter::from_fn(|| fixture.events.try_recv().ok()).collect();
+    assert!(
+        recovered(&events).is_empty(),
+        "a refused recovery is not published"
+    );
+    let sent = fixture.transport.sent();
+    assert_eq!(
+        delivery_receipts_for(&sent, REPLY_ID) + message_acks_for(&sent, REPLY_ID),
+        0,
+        "the reply carrying a refused recovery is not acked"
+    );
+    assert_eq!(
+        message_count_to_after(&sent, start, phone),
+        0,
+        "the phone is not asked again"
+    );
+    assert!(
+        fixture
+            .client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&fixture.phone_info),
+        "the reply's plaintext stays retained for its redelivery"
+    );
+    assert_eq!(
+        fixture
+            .client
+            .pdo_pending_requests
+            .get(&pending_key)
+            .await
+            .map(|(_, memo)| memo.request_id.clone())
+            .as_deref(),
+        Some("SYNTHETIC_PDO_REQUEST"),
+        "the request stays pending for the redelivered reply"
+    );
+
+    // The server redelivers the unacked reply.
+    fixture
+        .client
+        .clone()
+        .handle_incoming_message(fixture.phone_response.clone())
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&fixture.client).await;
+    assert_eq!(
+        *hook.0.lock().unwrap(),
+        [
+            (PdoRetryFixture::ID.to_owned(), true),
+            (PdoRetryFixture::ID.to_owned(), true),
+            (REPLY_ID.to_owned(), false),
+        ],
+        "the replay commits the recovery once, then the reply"
+    );
+    let events: Vec<_> = std::iter::from_fn(|| fixture.events.try_recv().ok()).collect();
+    assert_eq!(
+        recovered(&events),
+        [true],
+        "the recovery is published once, as committed"
+    );
+    let sent = fixture.transport.sent();
+    assert_eq!(
+        delivery_receipts_for(&sent, REPLY_ID),
+        1,
+        "the reply is acked once, after both commits"
+    );
+    assert_eq!(message_acks_for(&sent, REPLY_ID), 0);
+    assert_eq!(message_count_to_after(&sent, start, phone), 0);
+    assert!(
+        !fixture
+            .client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&fixture.phone_info)
+    );
+    assert!(
+        fixture
+            .client
+            .pdo_pending_requests
+            .get(&pending_key)
+            .await
+            .is_none(),
+        "the committed recovery answered its request"
+    );
+}
+
+/// Commits nothing; it only makes the client one with an inbound hook.
+struct AcceptingInboundHook;
+
+#[async_trait::async_trait]
+impl crate::types::durability_hook::InboundDurabilityHook for AcceptingInboundHook {
+    async fn on_messages(
+        &self,
+        _: Arc<Client>,
+        _: &[wacore::types::events::InboundMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A copy of `text` under `info`, as a commit batch holds it.
+fn batched_copy(
+    info: &Arc<MessageInfo>,
+    text: &str,
+    consumer_claimed: bool,
+) -> raw_pending::PendingDelivery {
+    let mut message = wa::Message::default();
+    message.conversation = Some(text.into());
+    let mut copy = raw_pending::PendingDelivery::from(
+        wacore::types::events::InboundMessage::builder()
+            .message(Arc::new(message))
+            .info(Arc::clone(info))
+            .build(),
+    );
+    copy.consumer_claimed = consumer_claimed;
+    copy
+}
+
+/// The claim a recovery of `text` under `info` leaves once the hook has
+/// committed it and its event is published (`handle_placeholder_resend_response`).
+fn claim_committed_recovery(client: &Client, info: &Arc<MessageInfo>, text: &str) {
+    let mut message = wa::Message::default();
+    message.conversation = Some(text.into());
+    let mut publication = PublicationGuard::default();
+    assert!(
+        !client.admit_message_dispatch(
+            info,
+            true,
+            Some(MessageDispatch::fingerprint(&message)),
+            true,
+            &mut publication,
+        ),
+        "the recovery is the first copy of its payload"
+    );
+    client.complete_dispatch_publication(publication, [info], true);
+}
+
+/// A batch the consumer has seen nothing of comes back as it came: with the
+/// inbound hook registered every entry is looked up, and when none is removed
+/// the result is the same allocation and nothing is allocated for it.
+#[tokio::test]
+async fn undelivered_entries_return_an_unseen_batch_unchanged() {
+    let client = crate::test_utils::create_test_client_with_name("undelivered_unseen").await;
+    assert!(
+        client
+            .inbound_durability_hook
+            .set(Arc::new(AcceptingInboundHook))
+            .is_ok()
+    );
+    let peer = "5511000000003@s.whatsapp.net";
+    let items: Arc<[raw_pending::PendingDelivery]> = ["UNSEEN-1", "UNSEEN-2", "UNSEEN-3"]
+        .map(|id| {
+            batched_copy(
+                &Arc::new(create_test_message_info(peer, id, peer)),
+                id,
+                false,
+            )
+        })
+        .into();
+
+    assert!(Arc::ptr_eq(
+        &client.undelivered_entries(Arc::clone(&items)),
+        &items
+    ));
+    assert_eq!(
+        crate::test_alloc::min_allocs(0, || client.undelivered_entries(Arc::clone(&items))),
+        0,
+        "a batch with nothing to remove allocates nothing"
+    );
+    assert_eq!(client.stats().messages_suppressed_duplicate, 0);
+}
+
+/// Only the inbound hook commits recoveries, so a client without it looks
+/// none up: its batch comes back as it came, with nothing allocated, even with
+/// the journal on (here for the history-sync hook) and the cache holding the
+/// claim such a commit leaves, planted by hand since nothing else makes one.
+#[tokio::test]
+async fn undelivered_entries_look_up_no_recovery_without_inbound_hook() {
+    struct AcceptingHistoryHook;
+
+    #[async_trait::async_trait]
+    impl crate::HistorySyncDurabilityHook for AcceptingHistoryHook {
+        async fn on_notification(
+            &self,
+            _: &crate::HistorySyncKey,
+            _: &crate::HistorySyncMetadata<'_>,
+            _: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_compressed_chunk(
+            &self,
+            _: &crate::HistorySyncKey,
+            _: &crate::HistorySyncMetadata<'_>,
+            _: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let client =
+        crate::test_utils::create_test_client_with_name("undelivered_no_inbound_hook").await;
+    assert!(
+        client
+            .history_sync_durability_hook
+            .set(Arc::new(AcceptingHistoryHook))
+            .is_ok()
+    );
+    assert!(client.inbound_journal_enabled());
+    let peer = "5511000000004@s.whatsapp.net";
+    let recovered = Arc::new(create_test_message_info(peer, "RECOVERED", peer));
+    claim_committed_recovery(&client, &recovered, "recovered");
+    let other = Arc::new(create_test_message_info(peer, "OTHER", peer));
+    let items: Arc<[raw_pending::PendingDelivery]> = [
+        batched_copy(&recovered, "recovered", false),
+        batched_copy(&other, "other", false),
+    ]
+    .into();
+
+    assert!(Arc::ptr_eq(
+        &client.undelivered_entries(Arc::clone(&items)),
+        &items
+    ));
+    assert_eq!(
+        crate::test_alloc::min_allocs(0, || client.undelivered_entries(Arc::clone(&items))),
+        0,
+        "without the inbound hook nothing is looked up or allocated"
+    );
+    assert_eq!(client.stats().messages_suppressed_duplicate, 0);
+}
+
+/// A copy whose payload a committed recovery carries is removed and counted
+/// once as a suppressed duplicate; a consumer-claimed copy is removed without
+/// being counted again, its claim having been accounted for when it was
+/// taken. The rest stays, in order, another payload under the recovered
+/// message's identity included.
+#[tokio::test]
+async fn undelivered_entries_count_each_committed_recovery_copy_once() {
+    let client = crate::test_utils::create_test_client_with_name("undelivered_counted").await;
+    assert!(
+        client
+            .inbound_durability_hook
+            .set(Arc::new(AcceptingInboundHook))
+            .is_ok()
+    );
+    let peer = "5511000000005@s.whatsapp.net";
+    let recovered = Arc::new(create_test_message_info(peer, "RECOVERED", peer));
+    claim_committed_recovery(&client, &recovered, "recovered");
+    let first = Arc::new(create_test_message_info(peer, "FIRST", peer));
+    let last = Arc::new(create_test_message_info(peer, "LAST", peer));
+    let items: Arc<[raw_pending::PendingDelivery]> = [
+        batched_copy(&first, "first", false),
+        batched_copy(&recovered, "recovered", false),
+        batched_copy(&recovered, "recovered", true),
+        batched_copy(&recovered, "edited", false),
+        batched_copy(&last, "last", false),
+    ]
+    .into();
+
+    let undelivered = client.undelivered_entries(items);
+    assert_eq!(
+        undelivered
+            .iter()
+            .map(|entry| (
+                entry.info.id.as_str(),
+                entry.message.conversation.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("FIRST", Some("first")),
+            ("RECOVERED", Some("edited")),
+            ("LAST", Some("last")),
+        ]
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "only the unclaimed copy of the recovered payload is a new suppression"
+    );
 }
 
 async fn pdo_retry_synchronous_durable_publication(teardown: bool) {
@@ -19807,7 +20216,24 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
         )
         .await
         .unwrap();
-    assert!(hook.0.lock().unwrap()[0].enc_reaction_message.is_set());
+    {
+        let seen = hook.0.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0]
+                .reaction_message
+                .as_option()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some(text),
+            "the hook commits the phone's materialized recovery before its event"
+        );
+        assert!(
+            seen[1].enc_reaction_message.is_set(),
+            "the unresolved envelope is a payload of its own"
+        );
+    }
     fixture
         .client
         .persistence_manager
@@ -19834,23 +20260,11 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
         )
         .await
         .unwrap();
-    {
-        let seen = hook.0.lock().unwrap();
-        assert_eq!(
-            seen.len(),
-            2,
-            "an unresolved hook copy must not suppress the later materialized retry"
-        );
-        assert_eq!(
-            seen[1]
-                .reaction_message
-                .as_option()
-                .unwrap()
-                .text
-                .as_deref(),
-            Some(text)
-        );
-    }
+    assert_eq!(
+        hook.0.lock().unwrap().len(),
+        2,
+        "the materialized retry repeats the committed recovery, not the unresolved envelope"
+    );
     fixture
         .client
         .handle_decrypted_plaintext(

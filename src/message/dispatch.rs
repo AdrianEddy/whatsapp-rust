@@ -154,6 +154,53 @@ impl Client {
         })
     }
 
+    /// Whether the inbound hook already holds this PDO recovery's payload: a
+    /// live claim under its identity, or under the alias a recovery looks up,
+    /// carries the payload and the hook committed it, with an ordinary
+    /// delivery or a recovery's own commit (`RecoveredCommitted`, which a
+    /// promotion reaches without setting `hook_committed`). Admission with
+    /// `pdo` would then suppress the recovery; it decides again when it runs.
+    /// A live payload the hook never committed doesn't count, whatever
+    /// claimed it.
+    pub(crate) fn recovery_already_dispatched(
+        &self,
+        info: &Arc<MessageInfo>,
+        fingerprint: &DispatchFingerprint,
+    ) -> bool {
+        self.with_message_dispatch(info, true, |claim| {
+            claim.payloads.iter().any(|payload| {
+                payload.fingerprint == *fingerprint
+                    && payload.publication.state() != PUBLICATION_INTERRUPTED
+                    && (payload.hook_committed
+                        || payload.state == MessageDispatch::RecoveredCommitted)
+            })
+        })
+    }
+
+    /// Whether a recovery the hook committed already carries this ordinary
+    /// delivery's payload, so the consumer holds it: what the arrival probe
+    /// answers for a copy that arrives after that commit, asked again for a
+    /// copy that was already waiting in a drain batch then. The payload is
+    /// hashed only when a recovery is claimed under the identity. Asked only
+    /// with the inbound hook registered and the dispatch gate on, the one
+    /// configuration where such a claim can exist; its caller checks that once
+    /// per batch.
+    pub(super) fn committed_recovery_carries(
+        &self,
+        info: &Arc<MessageInfo>,
+        message: &wa::Message,
+    ) -> bool {
+        if crate::features::message_edit::carries_secret_encrypted(message)
+            || !self.with_message_dispatch(info, false, |claim| claim.has_recovery())
+        {
+            return false;
+        }
+        let fingerprint = MessageDispatch::fingerprint(message);
+        self.with_message_dispatch(info, false, |claim| {
+            claim.state(&fingerprint) == Some(MessageDispatch::RecoveredCommitted)
+        })
+    }
+
     pub(super) fn completed_hook_publication(
         &self,
         info: &Arc<MessageInfo>,

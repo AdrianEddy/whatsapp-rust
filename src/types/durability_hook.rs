@@ -4,7 +4,7 @@
 //! | --- | --- |
 //! | Encrypted live/offline direct and group messages | [`InboundDurabilityHook`] |
 //! | Newsletter/channel messages | [`InboundDurabilityHook`], each as a batch of one |
-//! | PDO recovery | No durable capture gate; event-only path |
+//! | PDO recovery | [`InboundDurabilityHook`], each as a batch of one, before its event |
 //! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
 //! | Admitted history chunks | [`HistorySyncCaptureHook`], registered separately |
 //! | History notifications with restart recovery | [`crate::HistorySyncDurabilityHook`] |
@@ -20,7 +20,8 @@ pub use wacore::types::events::InboundMessage;
 use waproto::whatsapp as wa;
 
 /// Hook invoked for every decrypted inbound user message, and every newsletter
-/// message, before it is acknowledged to the server, turning the consumer from
+/// message, before it is acknowledged to the server, and for every message the
+/// primary phone recovers before it is published, turning the consumer from
 /// at-most-once into at-least-once delivery.
 ///
 /// The transport ack tells the server to drop the message from its offline
@@ -63,10 +64,45 @@ use waproto::whatsapp as wa;
 /// maintenance from a separate control task and retry the durable batch.
 ///
 /// Scope and known limitations:
-/// - Covers end-to-end encrypted messages (1:1 and group) and newsletter /
-///   broadcast channel messages. PDO placeholder recoveries
-///   (`info.unavailable_request_id` is set) are not gated: their ack runs on the
-///   PDO path, so the hook never sees them.
+/// - Covers end-to-end encrypted messages (1:1 and group), newsletter /
+///   broadcast channel messages, and messages the primary phone recovers.
+/// - A message the primary phone recovers (a PDO placeholder resend, the
+///   answer to a message this device could not decrypt;
+///   `info.unavailable_request_id` names the request when the reply carries
+///   one) is committed alone, as a batch of one, before it is claimed and
+///   published. Its `info` is that of the stanza that failed to decrypt while
+///   that stanza's request is pending
+///   ([`CacheConfig::pdo_pending_requests`](crate::CacheConfig::pdo_pending_requests)),
+///   or is rebuilt from the reply when no request here matches it. Its
+///   `message` is the consumer projection an ordinary delivery gets: its
+///   `messageSecret` in `messageContextInfo` (also when the phone sent it
+///   beside the message, on the reply's `WebMessageInfo`) and captured, and a
+///   secret-encrypted add-on resolved when its parent's secret is known. It has
+///   no ack and no pending-inbound row of its own: it rides inside the phone's
+///   reply, whose own delivery this hook then commits as an ordinary message.
+///   That reply is the only copy, so `Err` fails the reply with it: nothing is
+///   published, no dispatch-cache claim is left, the reply is neither
+///   committed nor acked, and the request it answered stays pending for
+///   another window. The server redelivers the reply on the next connect and
+///   the recovery comes to this hook again from it, as any refused message
+///   does; the phone is not asked again. Until then the reply's plaintext is
+///   owned by this Client only, as described below for a failed buffer write,
+///   so a refused recovery survives reconnects but not the end of the Client
+///   or process, after which a redelivery the Signal session already
+///   decrypted is acked as a duplicate: only a new request to the phone
+///   ([`Client::retry_pdo_placeholder_resend_request`]) or the sender's own
+///   resend then brings the message back. Within the dispatch cache's
+///   retention window
+///   ([`CacheConfig::dispatched_messages`](crate::CacheConfig::dispatched_messages)),
+///   a recovery of a payload this hook already committed under the same
+///   message identity (the sender's own resend, say) is not passed to it again,
+///   and a copy that arrives after a recovery was committed, or waits in the
+///   offline drain's batch while it commits, is acked as a duplicate, reaching
+///   neither the hook nor the bus; one that arrives after the window is
+///   committed and published again. A copy whose own commit is already running
+///   when the recovery commits is committed too, and published once. The
+///   idempotence above absorbs both. The recovery's event says
+///   `hook_committed`.
 /// - A newsletter message (`info.source.chat.is_newsletter()`;
 ///   `InboundMessage::newsletter_ref` addresses it) is plaintext and is
 ///   committed alone, as a batch of one, live or offline. The ack it is owed
@@ -108,7 +144,8 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// durable; the SDK then acks every message in the batch. Return `Err` to
     /// suppress all their acks and have the server redeliver them.
     ///
-    /// Live messages and newsletter messages arrive as batches of one. During
+    /// Live messages, newsletter messages and recoveries from the primary
+    /// phone arrive as batches of one. During
     /// the offline drain the SDK accumulates encrypted messages and commits
     /// them per batch (WA Web's MessageProcessorCache granularity), so one
     /// round-trip covers the lot.

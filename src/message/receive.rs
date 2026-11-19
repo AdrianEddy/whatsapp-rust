@@ -2952,7 +2952,19 @@ impl Client {
         {
             // PDO recovery holds a decoded WebMessageInfo across storage awaits.
             // Allocate that rare future here so every chat lane need not carry it.
-            Box::pin(self.handle_pdo_response(pdo_response, info)).await;
+            if !Box::pin(self.handle_pdo_response(pdo_response, info)).await {
+                // The hook refused a message this reply recovers, and the reply
+                // is its only copy, so the reply fails here as its own refused
+                // commit would: neither committed nor acked, its plaintext
+                // stays retained (`dispatched`), and the server's redelivery
+                // replays it through this handler, taking the recovery to the
+                // hook again. Not `Err`, which would nack it.
+                self.inbound_commit_batch.live_retention.fail_receipt(info);
+                return Ok(PlaintextHandleOutcome {
+                    dispatched: true,
+                    ..Default::default()
+                });
+            }
         }
 
         // history_sync_notification is self-only (our phone drives history sync).

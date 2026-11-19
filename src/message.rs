@@ -456,10 +456,12 @@ impl DispatchClaim {
                 fingerprint,
                 hook_committed,
                 producer,
-                state: if pdo {
-                    MessageDispatch::Recovered
-                } else {
-                    MessageDispatch::Decrypted
+                // A recovery the hook committed is what a later ordinary
+                // delivery's commit would otherwise promote it to.
+                state: match (pdo, hook_committed) {
+                    (true, true) => MessageDispatch::RecoveredCommitted,
+                    (true, false) => MessageDispatch::Recovered,
+                    (false, _) => MessageDispatch::Decrypted,
                 },
                 publication: CachedPublication::Tracked(publication.owner()),
             });

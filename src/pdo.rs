@@ -12,7 +12,10 @@
 //! 1. Decryption fails for a message
 //! 2. We send a PeerDataOperationRequestMessage with type PLACEHOLDER_MESSAGE_RESEND
 //! 3. The phone responds with PeerDataOperationRequestResponseMessage containing the decoded message
-//! 4. We emit the message as if we had decrypted it ourselves
+//! 4. With an `InboundDurabilityHook` registered, the hook commits the message first: the phone's
+//!    reply is its only copy, so a refusal emits nothing and fails the reply, which stays unacked
+//!    until its redelivery brings the message to the hook again
+//! 5. We emit the message as if we had decrypted it ourselves
 
 use crate::client::Client;
 use crate::types::message::MessageInfo;
@@ -1059,19 +1062,25 @@ impl Client {
     /// # Arguments
     /// * `response` - The PDO response message
     /// * `info` - The MessageInfo for the PDO response message itself
+    ///
+    /// Returns `false` when the inbound durability hook refused a message the
+    /// response recovers. The response is that message's only copy, so the
+    /// stanza carrying it must then stay uncommitted and unacked, as for any
+    /// commit the hook refuses, and its redelivery handles the response again.
+    /// Every other outcome, handled or ignored, returns `true`.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.handle_response", level = "debug", skip_all, fields(sender = %pdo_msg_info.source.sender.observe())))]
     pub(crate) async fn handle_pdo_response(
         self: &Arc<Self>,
         response: &wa::message::PeerDataOperationRequestResponseMessage,
         pdo_msg_info: &MessageInfo,
-    ) {
+    ) -> bool {
         // Only process PDO responses from device 0 (the primary phone)
         if pdo_msg_info.source.sender.device != 0 {
             debug!(
                 "Ignoring PDO response from non-primary device {}",
                 pdo_msg_info.source.sender.observe()
             );
-            return;
+            return true;
         }
 
         let request_id = response.stanza_id.as_deref().unwrap_or("");
@@ -1084,9 +1093,13 @@ impl Client {
         for result in &response.peer_data_operation_result {
             if let Some(placeholder_response) =
                 result.placeholder_message_resend_response.as_option()
+                && !self
+                    .handle_placeholder_resend_response(placeholder_response, request_id)
+                    .await
             {
-                self.handle_placeholder_resend_response(placeholder_response, request_id)
-                    .await;
+                // The rest is handled with the redelivery, which skips the
+                // recoveries committed before this one.
+                return false;
             }
         }
 
@@ -1137,6 +1150,7 @@ impl Client {
                 );
             }
         }
+        true
     }
 
     /// Apply a collection the primary sent back after a snapshot we refused.
@@ -1466,14 +1480,18 @@ impl Client {
             .await;
     }
 
+    /// Commits (with an inbound durability hook) and publishes the message one
+    /// placeholder resend result recovers. `false` only when the hook refused
+    /// it: the request it answers is then filed again for the reply's
+    /// redelivery. Published, suppressed and ignored results are `true`.
     async fn handle_placeholder_resend_response(
         self: &Arc<Self>,
         response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse,
         request_id: &str,
-    ) {
+    ) -> bool {
         let Some(web_message_info_bytes) = &response.web_message_info_bytes else {
             warn!("PDO placeholder response missing webMessageInfoBytes");
-            return;
+            return true;
         };
 
         // Owned decode (not a view): WebMessageInfo carries a nested `message`
@@ -1485,13 +1503,13 @@ impl Client {
             Ok(info) => info,
             Err(e) => {
                 warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
-                return;
+                return true;
             }
         };
 
         let Some(key) = web_msg_info.key.as_option() else {
             warn!("PDO response WebMessageInfo missing key");
-            return;
+            return true;
         };
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
         let msg_id = key.id.as_deref().unwrap_or("");
@@ -1505,7 +1523,7 @@ impl Client {
                     "PDO response has unparseable remote_jid: {}",
                     remote_jid_str
                 );
-                return;
+                return true;
             }
         };
 
@@ -1528,6 +1546,10 @@ impl Client {
             .pdo_pending_requests
             .remove_if(&cache_key, &matches_pending)
             .await;
+        // Where the request was filed, should a refusal file it again: under
+        // this key, or else under `alias_key` (the alias or explicit key it
+        // was found under below).
+        let filed_under_response_key = pending.is_some();
         let mut alias_key = if !cache_key.chat.is_group() {
             self.swap_pn_lid_namespace(&cache_key.chat)
                 .await
@@ -1590,8 +1612,7 @@ impl Client {
                 alias_key = Some(key);
             }
         }
-        let authority = pending.as_ref().map(|(_, memo)| memo.clone());
-        let pending = pending.map(|(entry, _)| entry);
+        let authority = pending.as_ref().map(|(_, memo)| memo);
         if self
             .obsolete_pdo_response(
                 &cache_key,
@@ -1599,16 +1620,16 @@ impl Client {
                 response_from_me,
                 response_participant.as_deref(),
                 request_id,
-                authority.as_ref(),
+                authority,
             )
             .await
         {
-            return;
+            return true;
         }
 
         let elapsed = pending
             .as_ref()
-            .map(|p| {
+            .map(|(p, _)| {
                 self.runtime
                     .monotonic_time()
                     .saturating_duration_since(p.requested_at)
@@ -1621,8 +1642,8 @@ impl Client {
             msg_id, elapsed
         );
 
-        let mut message_info = if let Some(pending) = pending {
-            pending.message_info
+        let mut message_info = if let Some((pending, _)) = &pending {
+            Arc::clone(&pending.message_info)
         } else {
             match self.message_info_from_web_message_info(&web_msg_info).await {
                 Ok(info) => Arc::new(info),
@@ -1631,22 +1652,41 @@ impl Client {
                         "Failed to reconstruct MessageInfo from PDO response: {:?}",
                         e
                     );
-                    return;
+                    return true;
                 }
             }
         };
 
-        let Some(message) = web_msg_info.message.take() else {
+        let Some(mut message) = web_msg_info.message.take() else {
             // Expected when the phone could not decrypt the message either;
             // WA Web only counts this outcome in telemetry, with no warning.
             info!("PDO response WebMessageInfo missing message content");
-            return;
+            return true;
         };
-
-        let ephemeral_expiration = {
-            use wacore::proto_helpers::MessageExt;
-            message.get_base_message().get_ephemeral_expiration()
+        // The phone's `WebMessageInfo` can keep the message's secret beside
+        // the message (field 49, which history sync reads first) rather than
+        // in its context. Carry it into the context, where an ordinary
+        // delivery has it, as a decrypted comment's outer secret is carried
+        // onto its body: the capture below and the consumer both read it there.
+        if let Some(secret) = web_msg_info.message_secret.take() {
+            let context = message.message_context_info.get_or_insert_default();
+            if context.message_secret.is_none() {
+                context.message_secret = Some(secret);
+            }
+        }
+        Arc::make_mut(&mut message_info).unavailable_request_id = if request_id.is_empty() {
+            None
+        } else {
+            Some(request_id.to_owned())
         };
+        // The consumer projection every other producer builds: the secret
+        // captured for the add-ons that name this message, a secret-encrypted
+        // envelope materialized. Built before the last obsolescence check, so
+        // that check stays the last await before the claim and the
+        // publication, the hook's commit aside.
+        let item = self
+            .prepare_shared_inbound_message(Arc::new(message), &message_info, None)
+            .await;
         if self
             .obsolete_pdo_response(
                 &cache_key,
@@ -1654,29 +1694,77 @@ impl Client {
                 response_from_me,
                 response_participant.as_deref(),
                 request_id,
-                authority.as_ref(),
+                authority,
             )
             .await
         {
-            return;
+            return true;
         }
-        Arc::make_mut(&mut message_info).unavailable_request_id = if request_id.is_empty() {
-            None
-        } else {
-            Some(request_id.to_owned())
-        };
 
+        // Claimed by the projection, as the batcher and the arrival probe
+        // claim an ordinary copy, so a materialized recovery and a
+        // materialized resend are one payload. An envelope that stayed
+        // unresolved is not claimed.
         let claim = self.dispatch_gate_enabled()
-            && !crate::features::message_edit::carries_secret_encrypted(&message);
-        let fingerprint = claim.then(|| crate::message::MessageDispatch::fingerprint(&message));
+            && !crate::features::message_edit::carries_secret_encrypted(&item.message);
+        let fingerprint =
+            claim.then(|| crate::message::MessageDispatch::fingerprint(&item.message));
+        // The recovery bypasses the commit batcher: it has no stanza of its
+        // own, only a place inside the phone's reply, whose delivery the
+        // batcher commits and acks as an ordinary message once the reply's
+        // recoveries are settled. So nothing here is acked and nothing goes to
+        // the pending-inbound journal. The hook and the event share these
+        // items.
+        let items: Arc<[wacore::types::events::InboundMessage]> = Arc::from([item]);
+        let hook = self.inbound_durability_hook();
+        // With a hook the reply is the phone's only copy: commit it before it
+        // is claimed and published. A payload the hook already committed
+        // under this identity, with an ordinary delivery or an earlier
+        // recovery (`recovery_already_dispatched`), is left to admission's
+        // suppression below without committing it again; one claimed without
+        // a commit is committed first. The claim is taken only after `Ok`, so
+        // a refusal leaves none that could suppress a later copy, and
+        // admission and publication stay one region with no await
+        // (`DispatchClaim::admit`).
+        if let Some(hook) = &hook
+            && fingerprint.is_none_or(|fp| !self.recovery_already_dispatched(&message_info, &fp))
+            && let Err(error) = self.call_inbound_hook(hook.as_ref(), &items).await
+        {
+            warn!(
+                "Inbound durability hook refused PDO-recovered message {} from {}; its reply stays unacked for redelivery: {error:?}",
+                message_info.id,
+                message_info.source.sender.observe()
+            );
+            // Filed again where it was found, so the redelivered reply is
+            // matched to its request and keeps the `MessageInfo` of the stanza
+            // that failed to decrypt, for another request window. A request
+            // filed there meanwhile stays.
+            let filed = if filed_under_response_key {
+                Some(&cache_key)
+            } else {
+                alias_key.as_ref()
+            };
+            if let (Some(pending), Some(filed)) = (pending, filed) {
+                self.pdo_pending_requests
+                    .upsert_with_by_ref(filed, |current| (current.is_none().then_some(pending), ()))
+                    .await;
+            }
+            return false;
+        }
+
         let mut publication = crate::message::PublicationGuard::default();
-        let suppressed =
-            self.admit_message_dispatch(&message_info, true, fingerprint, false, &mut publication);
+        let suppressed = self.admit_message_dispatch(
+            &message_info,
+            true,
+            fingerprint,
+            hook.is_some(),
+            &mut publication,
+        );
         if suppressed {
             self.duplicate_dispatch_suppressed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             wacore::telemetry::recv("duplicate_resend");
-            return;
+            return true;
         }
 
         info!(
@@ -1686,22 +1774,17 @@ impl Client {
             request_id
         );
 
-        // PDO recovery is event-only (its ack runs on the PDO path, not the
-        // message pipeline), so this bypasses the commit batcher on purpose.
         self.core
             .event_bus
             .dispatch(wacore::types::events::Event::Messages(
                 wacore::types::events::MessageBatch::builder()
-                    .messages(Arc::from([wacore::types::events::InboundMessage::builder(
-                    )
-                    .message(Arc::from(message))
-                    .info(Arc::clone(&message_info))
-                    .maybe_ephemeral_expiration(ephemeral_expiration)
-                    .build()]))
+                    .messages(items)
                     .origin(wacore::types::events::BatchOrigin::Live)
+                    .hook_committed(hook.is_some())
                     .build(),
             ));
         self.complete_dispatch_publication(publication, [&message_info], true);
+        true
     }
 
     async fn obsolete_pdo_response(
@@ -1930,6 +2013,9 @@ impl Client {
         }
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]

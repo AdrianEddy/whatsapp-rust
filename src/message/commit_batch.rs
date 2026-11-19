@@ -48,7 +48,7 @@ impl Client {
     /// `hook.on_messages(batch)`, with this client marked as inside its inbound
     /// hook for every poll, so the Signal maintenance the hook reaches refuses
     /// ([`Self::ensure_signal_maintenance_context`]) on every path that commits.
-    pub(super) fn call_inbound_hook<'a>(
+    pub(crate) fn call_inbound_hook<'a>(
         self: &'a Arc<Self>,
         hook: &'a dyn crate::types::durability_hook::InboundDurabilityHook,
         batch: &'a [InboundMessage],
@@ -1556,6 +1556,44 @@ impl Client {
         .await
     }
 
+    /// The entries whose payload the consumer hasn't seen: not claimed by a
+    /// delivery already published, and not carrying a payload that a recovery
+    /// from the primary phone committed while they waited in the batch, which
+    /// the arrival probe would have found had they arrived after that commit.
+    /// Such a copy is counted as a suppressed duplicate, as the probe or the
+    /// admission after the commit counts the copies it keeps from consumers; a
+    /// consumer-claimed entry was accounted for where its claim was taken.
+    /// Returns `items` itself when nothing is removed, allocating nothing.
+    /// Synchronous, so its scratch stays out of the commit's future.
+    pub(super) fn undelivered_entries(
+        &self,
+        items: Arc<[PendingDelivery]>,
+    ) -> Arc<[PendingDelivery]> {
+        // Only the inbound hook commits recoveries, so without it, or with the
+        // dispatch gate off, no `RecoveredCommitted` claim exists to look for.
+        let recoveries =
+            self.inbound_durability_hook.get().is_some() && self.dispatch_gate_enabled();
+        let mut retained: Option<Vec<PendingDelivery>> = None;
+        for (index, entry) in items.iter().enumerate() {
+            let delivered = if entry.consumer_claimed {
+                true
+            } else if recoveries && self.committed_recovery_carries(&entry.info, &entry.message) {
+                self.duplicate_dispatch_suppressed
+                    .fetch_add(1, Ordering::Relaxed);
+                wacore::telemetry::recv("duplicate_resend");
+                true
+            } else {
+                false
+            };
+            if delivered {
+                retained.get_or_insert_with(|| items[..index].to_vec());
+            } else if let Some(retained) = &mut retained {
+                retained.push(entry.clone());
+            }
+        }
+        retained.map(Arc::from).unwrap_or(items)
+    }
+
     /// Collapse deliveries of one message inside a batch, keeping the first.
     ///
     /// Returns the input untouched when there is nothing to drop, which is
@@ -1778,15 +1816,7 @@ impl Client {
         }
         // Already delivered entries still need persistence and cleanup, but
         // must not hide an equivalent entry that the consumer has not seen.
-        let items = if items.iter().any(|entry| entry.consumer_claimed) {
-            items
-                .iter()
-                .filter(|entry| !entry.consumer_claimed)
-                .cloned()
-                .collect()
-        } else {
-            items
-        };
+        let items = self.undelivered_entries(items);
         let items = if self.dispatch_gate_enabled() {
             self.dedup_batch_by_message(items)
         } else {

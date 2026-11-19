@@ -1069,8 +1069,11 @@ pub enum Event {
     /// dispatches again. Newsletter messages go through the hook as batches
     /// of one but bypass the commit batcher and the `dispatched_messages`
     /// window, so a redelivery after a lost ack dispatches again. PDO
-    /// placeholder recoveries (identified by `info.unavailable_request_id`)
-    /// bypass the hook and dispatch event-only.
+    /// placeholder recoveries (`info.unavailable_request_id` names the request
+    /// when the phone's reply carries one) bypass the commit batcher too: with
+    /// a hook each is committed as a batch of one before its event, and one the
+    /// hook refuses is not dispatched; the phone's reply then stays unacked, and
+    /// its redelivery takes the recovery to the hook again.
     ///
     /// A sender retrying its own outbox resends one message re-encrypted, which
     /// no ratchet can see as a duplicate. Such a resend collapses to a single
@@ -1567,11 +1570,11 @@ pub struct MessageBatch {
     /// materializer that the hook feeds can skip the batch instead of
     /// rewriting every row (and re-firing every invalidation) a second time.
     ///
-    /// `false` for the producers that dispatch `Event::Messages` while
-    /// deliberately bypassing the commit pipeline — PDO-recovered messages,
-    /// and newsletters while no hook is registered — because for those the
-    /// materialization on this event is the only one there is. With a hook a
-    /// newsletter message is committed alone before its event, which says so.
+    /// `false` for the producers that bypass the commit batcher while no hook
+    /// is registered — PDO-recovered messages and newsletters — because for
+    /// those the materialization on this event is the only one there is. With
+    /// a hook a newsletter message or a PDO recovery is committed alone before
+    /// its event, which says so.
     #[builder(default)]
     pub hook_committed: bool,
 }
