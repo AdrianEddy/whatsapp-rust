@@ -6,12 +6,14 @@
 //! eviction and an async, single-flight `get_with`.
 //!
 //! `get_with` / `get_with_by_ref` are single-flight: concurrent inits for the
-//! same missing key run the initializer once.
+//! same missing key run the initializer once. `try_get_with` is their
+//! fallible form: an `Err` inserts nothing, and the next waiter runs its own.
 
 use async_lock::{Mutex as AsyncMutex, RwLock};
 use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1892,7 +1894,13 @@ where
         if let Some(v) = self.get(&key).await {
             return v;
         }
-        self.get_with_slow(key, Box::pin(init)).await
+        let Ok(value) = self
+            .get_with_slow(
+                key,
+                Box::pin(async move { Ok::<_, Infallible>(init.await) }),
+            )
+            .await;
+        value
     }
 
     /// Get or insert (single-flight). Takes key by reference — only allocates
@@ -1907,14 +1915,40 @@ where
         if let Some(v) = self.get(key).await {
             return v;
         }
-        self.get_with_slow(key.to_owned(), Box::pin(init)).await
+        let Ok(value) = self
+            .get_with_slow(
+                key.to_owned(),
+                Box::pin(async move { Ok::<_, Infallible>(init.await) }),
+            )
+            .await;
+        value
     }
 
-    /// Miss path shared by [`get_with`](Self::get_with) and
-    /// [`get_with_by_ref`](Self::get_with_by_ref): single-flight init under the
+    /// Get or insert (single-flight) with a fallible initializer. Takes key by
+    /// value.
+    ///
+    /// As [`get_with`](Self::get_with), but an `Err` from `init` goes to its
+    /// own caller only and inserts nothing: a caller waiting for the same key
+    /// then runs its own `init` rather than sharing the error. An `Ok` value
+    /// is inserted and returned to the waiters, which don't run theirs.
+    #[inline]
+    pub async fn try_get_with<F, E>(&self, key: K, init: F) -> Result<V, E>
+    where
+        F: Future<Output = Result<V, E>> + MaybeSend,
+    {
+        if let Some(v) = self.get(&key).await {
+            return Ok(v);
+        }
+        self.get_with_slow(key, Box::pin(init)).await
+    }
+
+    /// Miss path shared by [`get_with`](Self::get_with),
+    /// [`get_with_by_ref`](Self::get_with_by_ref) (with `E = Infallible`) and
+    /// [`try_get_with`](Self::try_get_with): single-flight init under the
     /// per-key lock, with a double-checked `get` so a collided or racing key
-    /// still resolves to the first inserted value.
-    async fn get_with_slow(&self, key: K, init: BoxFuture<'_, V>) -> V {
+    /// still resolves to the first inserted value. An `Err` inserts nothing,
+    /// so the next caller waiting for the lock runs its own init.
+    async fn get_with_slow<E>(&self, key: K, init: BoxFuture<'_, Result<V, E>>) -> Result<V, E> {
         let registry = self.init_locks();
         let hash = registry.hash_of(&key);
         // The cleanup guard holds the sole long-lived Arc so its Drop sees an
@@ -1934,10 +1968,12 @@ where
                 .await;
             // Double-check after acquiring the per-key lock.
             if let Some(v) = self.get(&key).await {
-                v
+                Ok(v)
             } else {
-                let value = init.await;
-                self.insert_and_return(key, value).await
+                match init.await {
+                    Ok(value) => Ok(self.insert_and_return(key, value).await),
+                    Err(error) => Err(error),
+                }
             }
         };
 
@@ -2045,6 +2081,9 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
         }
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

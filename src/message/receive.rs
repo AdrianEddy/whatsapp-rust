@@ -2,6 +2,9 @@
 
 use super::*;
 use crate::client::PermitSuspension;
+use crate::types::durability_hook::{
+    UndecryptableCause, UndecryptableFailure, UndecryptableRecovery,
+};
 use smallvec::SmallVec;
 use wacore::telemetry::LiveAdmissionRefusal;
 use wacore_binary::diagnostics::{ObservedId, ProtocolText};
@@ -525,6 +528,24 @@ impl Client {
             );
             let unrecoverable = unavailable_type.is_unrecoverable_fanout();
 
+            let cause = UndecryptableCause {
+                failure: UndecryptableFailure::Unavailable(unavailable_type),
+                recovery: if unrecoverable {
+                    UndecryptableRecovery::NoRequest
+                } else {
+                    UndecryptableRecovery::PlaceholderResend
+                },
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            };
+            if self
+                .dispatch_undecryptable_event(Arc::clone(&info), cause)
+                .await
+                .is_err()
+            {
+                // Neither the request to the phone nor the ack: the server
+                // delivers the stub again.
+                return None;
+            }
             if unrecoverable {
                 log::info!(
                     "[msg:{}] Message has unrecoverable <unavailable> child (type: {:?}); \
@@ -539,14 +560,6 @@ impl Client {
                     unavailable_type,
                 );
             }
-
-            self.dispatch_undecryptable_event(
-                Arc::clone(&info),
-                true,
-                unavailable_type,
-                crate::types::events::DecryptFailMode::Show,
-            )
-            .await;
             let client = Arc::clone(self);
             let info2 = Arc::clone(&info);
             let skip_ack = info.source.chat.is_status_broadcast();
@@ -574,7 +587,9 @@ impl Client {
         let mut bot_payloads = Vec::new();
         let mut max_sender_retry_count = 0;
         let mut has_hide_fail = false;
-        let mut had_unknown_enc = false;
+        // The first reason an `<enc>` produced no usable payload: the type is
+        // unrecognized, or it is missing or the body is empty.
+        let mut unusable_enc: Option<EncDecryptFailureReason> = None;
         let mut had_custom_handler = false;
 
         // Custom enc handlers are set once at Bot::build and immutable after, so
@@ -604,7 +619,7 @@ impl Client {
                         None,
                         EncDecryptFailureReason::MalformedNode,
                     );
-                    had_unknown_enc = true;
+                    unusable_enc.get_or_insert(EncDecryptFailureReason::MalformedNode);
                     continue;
                 }
             };
@@ -636,7 +651,7 @@ impl Client {
                 continue;
             }
 
-            // `had_unknown_enc` means "produced no usable payload": either the
+            // `unusable_enc` means "produced no usable payload": either the
             // type is unrecognized or it's known but the body is empty.
             // Either way the stanza needs the fallback ack or the server replays.
             let Some(parsed_enc_type) = EncType::from_wire(enc_type.as_ref()) else {
@@ -647,7 +662,7 @@ impl Client {
                     Some(enc_type.as_ref()),
                     EncDecryptFailureReason::UnsupportedEncType,
                 );
-                had_unknown_enc = true;
+                unusable_enc.get_or_insert(EncDecryptFailureReason::UnsupportedEncType);
                 continue;
             };
 
@@ -662,7 +677,7 @@ impl Client {
                             Some(enc_type.as_ref()),
                             EncDecryptFailureReason::MalformedNode,
                         );
-                        had_unknown_enc = true;
+                        unusable_enc.get_or_insert(EncDecryptFailureReason::MalformedNode);
                         continue;
                     }
                 };
@@ -694,6 +709,12 @@ impl Client {
             );
         }
 
+        let decrypt_fail_mode = if has_hide_fail {
+            crate::types::events::DecryptFailMode::Hide
+        } else {
+            crate::types::events::DecryptFailMode::Show
+        };
+
         // Unknown-only stanzas would loop in the offline queue until
         // <stream:error>. Custom handlers ack on their own; status is covered
         // by should_ack. Ack from `nr` so `recipient` survives. Skip when any
@@ -702,9 +723,26 @@ impl Client {
         if session_payloads.is_empty()
             && group_payloads.is_empty()
             && bot_payloads.is_empty()
-            && had_unknown_enc
             && !had_custom_handler
+            && let Some(failure) = unusable_enc
         {
+            // A message that produced no plaintext, reported as any other
+            // before its ack. A refused report leaves the stanza unacked: its
+            // redelivery classifies the same way and reports it again.
+            if self
+                .dispatch_undecryptable_event(
+                    Arc::clone(&info),
+                    UndecryptableCause::enc(
+                        failure,
+                        UndecryptableRecovery::NoRequest,
+                        decrypt_fail_mode,
+                    ),
+                )
+                .await
+                .is_err()
+            {
+                return None;
+            }
             log::info!(
                 "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
                 ObservedId::new(info.id.as_str())
@@ -726,11 +764,7 @@ impl Client {
             group_payloads,
             bot_payloads,
             max_sender_retry_count,
-            decrypt_fail_mode: if has_hide_fail {
-                crate::types::events::DecryptFailMode::Hide
-            } else {
-                crate::types::events::DecryptFailMode::Show
-            },
+            decrypt_fail_mode,
             ack_recipient,
         })
     }
@@ -850,13 +884,14 @@ impl Client {
             log::warn!(
                 "Companion prekey message with an unverifiable ADV identity; requesting retry"
             );
+            let failure = EncDecryptFailureReason::UntrustedIdentity;
             for abandoned in session_payloads
                 .iter()
                 .chain(&group_payloads)
                 .chain(&bot_payloads)
             {
                 let reason = if abandoned.enc_index == invalid_companion_enc {
-                    EncDecryptFailureReason::UntrustedIdentity
+                    failure
                 } else {
                     EncDecryptFailureReason::NotAttempted
                 };
@@ -873,6 +908,7 @@ impl Client {
                 .await;
             self.handle_decrypt_failure(
                 &info,
+                failure,
                 RetryReason::AdvFailure,
                 decrypt_fail_mode,
                 ack_recipient.as_ref(),
@@ -966,6 +1002,9 @@ impl Client {
         // Admission precedes every ratchet mutation. Refusal leaves ciphertext
         // untouched for server redelivery; reset never evicts a retained live row.
         let _live_admission = if self.inbound_journal_enabled() {
+            // Also makes the undecryptable report an earlier delivery of this
+            // message owes, which this copy can't make (it decrypts as a
+            // duplicate); a refusal leaves it unanswered too.
             if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
                 wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 log::warn!(
@@ -988,6 +1027,7 @@ impl Client {
                 wire_bytes,
                 slots,
                 &info,
+                decrypt_fail_mode,
             );
             if admission.is_err()
                 && self.inbound_commit_batch.is_active()
@@ -1019,6 +1059,7 @@ impl Client {
                     wire_bytes,
                     slots,
                     &info,
+                    decrypt_fail_mode,
                 );
             }
             match admission {
@@ -1123,6 +1164,16 @@ impl Client {
         let session_decrypted_successfully = session_outcome.decrypted;
         let session_had_duplicates = session_outcome.duplicate;
         let session_dispatched_undecryptable = session_outcome.undecryptable;
+        // What the two reports below say when the session batch reported
+        // nothing: the failure it left to them, or session payloads it never
+        // attempted. The stanza stays unanswered for redelivery.
+        let unreported_cause = UndecryptableCause::enc(
+            session_outcome
+                .unreported_failure
+                .unwrap_or(EncDecryptFailureReason::NotAttempted),
+            UndecryptableRecovery::Redelivery,
+            decrypt_fail_mode,
+        );
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -1205,13 +1256,11 @@ impl Client {
                             info.source.sender.observe()
                         );
                         if !session_dispatched_undecryptable {
-                            self.dispatch_undecryptable_event(
-                                Arc::clone(&info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
-                                decrypt_fail_mode,
-                            )
-                            .await;
+                            // Nothing here answers the stanza, so a refused
+                            // report changes nothing: it comes again either way.
+                            let _ = self
+                                .dispatch_undecryptable_event(Arc::clone(&info), unreported_cause)
+                                .await;
                         }
                     }
 
@@ -1243,13 +1292,11 @@ impl Client {
                     ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
-                self.dispatch_undecryptable_event(
-                    Arc::clone(&info),
-                    false,
-                    crate::types::events::UnavailableType::Unknown,
-                    decrypt_fail_mode,
-                )
-                .await;
+                // Nothing here answers the stanza, so a refused report
+                // changes nothing: it comes again either way.
+                let _ = self
+                    .dispatch_undecryptable_event(Arc::clone(&info), unreported_cause)
+                    .await;
             }
             // Do NOT send delivery receipt - transport ack is sufficient
         } else if session_had_duplicates
@@ -1276,9 +1323,34 @@ impl Client {
         // Bot-secret (msmsg) payloads run inline here so they're serialised
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
-        for payload in bot_payloads {
+        let mut bot_payloads = bot_payloads.into_iter();
+        while let Some(payload) = bot_payloads.next() {
+            // A refused undecryptable report settles the stanza for this
+            // delivery: a bot payload's failure would nack it, and its
+            // success could not be acked. The redelivery decrypts them again
+            // (no ratchet; the secret is kept).
+            if receipt_producer
+                .as_ref()
+                .is_some_and(live_retention::ReceiptProducer::answers_withheld)
+            {
+                for skipped in std::iter::once(payload).chain(bot_payloads.by_ref()) {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        skipped.enc_index,
+                        skipped.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
+                break;
+            }
             // Keep the bot-only decrypt frame out of every chat lane future.
-            Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
+            Box::pin(self.handle_msmsg_payload_in_scope(
+                &info,
+                payload,
+                stanza_origin,
+                decrypt_fail_mode,
+            ))
+            .await;
         }
 
         if let Some(producer) = &receipt_producer
@@ -1448,18 +1520,21 @@ impl Client {
                         EncDecryptFailureReason::PlaintextUnusable,
                     );
                     if outcome.recovery_deferred {
-                        // A NACK would also discard the unprocessed suffix.
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
+                        // A NACK would also discard the unprocessed suffix. The
+                        // stanza stays unacked either way; a refused report
+                        // stays owed to its redelivery, where this `<enc>`
+                        // decrypts as a duplicate.
+                        let report = self
+                            .report_unusable_plaintext(
+                                info,
+                                UndecryptableRecovery::Redelivery,
                                 decrypt_fail_mode,
                             )
                             .await;
+                        outcome.report_undecryptable(report);
                     } else {
-                        outcome.undecryptable |=
-                            self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                        let report = self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                        outcome.report_undecryptable(report);
                     }
                 }
             }
@@ -1596,24 +1671,20 @@ impl Client {
                         ObservedId::new(info.id.as_str()),
                         info.source.sender.observe()
                     );
-                    // |= so a later dedup'd return (false) can't clobber a true
-                    // set by a prior iteration in this batch.
+                    // Folded in, so a later dedup'd return (false) can't clobber
+                    // a true set by a prior iteration in this batch.
                     outcome.had_failure = true;
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        EncDecryptFailureReason::MalformedCiphertext,
-                    );
-                    outcome.undecryptable |= self
-                        .dispatch_undecryptable_event(
-                            Arc::clone(info),
-                            false,
-                            crate::types::events::UnavailableType::Unknown,
+                    let report = self
+                        .nack_failed_enc(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::MalformedCiphertext,
                             decrypt_fail_mode,
+                            NackReason::ParsingError,
                         )
                         .await;
-                    self.spawn_nack(info, NackReason::ParsingError, None);
+                    outcome.report_undecryptable(report);
                     continue;
                 }
             };
@@ -1844,6 +1915,9 @@ impl Client {
                                     address.observe()
                                 );
                                 outcome.had_failure = true;
+                                outcome
+                                    .unreported_failure
+                                    .get_or_insert(EncDecryptFailureReason::StorageFailure);
                                 self.report_enc_decrypt_failure(
                                     info,
                                     enc_index,
@@ -1858,6 +1932,9 @@ impl Client {
                                 address.observe()
                             );
                             outcome.had_failure = true;
+                            outcome
+                                .unreported_failure
+                                .get_or_insert(EncDecryptFailureReason::StorageFailure);
                             self.report_enc_decrypt_failure(
                                 info,
                                 enc_index,
@@ -1991,24 +2068,19 @@ impl Client {
                                                 ObservedId::new(info.id.as_str()),
                                                 address.observe()
                                             );
-                                            outcome.had_failure = true;
-                                            self.report_enc_decrypt_failure(
+                                            self.retry_failed_session_enc(
+                                                &mut outcome,
                                                 info,
                                                 enc_index,
                                                 enc_type,
                                                 terminal.unwrap_or(
                                                     EncDecryptFailureReason::UnknownPreKey,
                                                 ),
-                                            );
-                                            outcome.undecryptable |= self
-                                                .handle_decrypt_failure(
-                                                    info,
-                                                    retry_reason
-                                                        .unwrap_or(RetryReason::InvalidKeyId),
-                                                    decrypt_fail_mode,
-                                                    ack_recipient,
-                                                )
-                                                .await;
+                                                retry_reason.unwrap_or(RetryReason::InvalidKeyId),
+                                                decrypt_fail_mode,
+                                                ack_recipient,
+                                            )
+                                            .await;
                                         }
                                     }
                                 } else {
@@ -2019,8 +2091,7 @@ impl Client {
                                         retry_err
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
-                                    // to establish a new session with the new identity
-                                    outcome.had_failure = true;
+                                    // to establish a new session with the new identity.
                                     // The retry can fail for a reason that has
                                     // nothing to do with the identity that sent
                                     // it here — a MAC that would not verify, a
@@ -2032,26 +2103,24 @@ impl Client {
                                     // the more specific of the two: the retry
                                     // ran after the identity was cleared, and
                                     // nothing else explains it failing.
-                                    self.report_enc_decrypt_failure(
+                                    let failure = match session_error_reason(&retry_err) {
+                                        EncDecryptFailureReason::SignalError => {
+                                            EncDecryptFailureReason::UntrustedIdentity
+                                        }
+                                        reason => reason,
+                                    };
+                                    self.retry_failed_session_enc(
+                                        &mut outcome,
                                         info,
                                         enc_index,
                                         enc_type,
-                                        match session_error_reason(&retry_err) {
-                                            EncDecryptFailureReason::SignalError => {
-                                                EncDecryptFailureReason::UntrustedIdentity
-                                            }
-                                            reason => reason,
-                                        },
-                                    );
-                                    outcome.undecryptable |= self
-                                        .handle_decrypt_failure(
-                                            info,
-                                            local_crypto_retry_reason(&retry_err)
-                                                .unwrap_or(RetryReason::InvalidKey),
-                                            decrypt_fail_mode,
-                                            ack_recipient,
-                                        )
-                                        .await;
+                                        failure,
+                                        local_crypto_retry_reason(&retry_err)
+                                            .unwrap_or(RetryReason::InvalidKey),
+                                        decrypt_fail_mode,
+                                        ack_recipient,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -2123,21 +2192,17 @@ impl Client {
                             enc_type,
                             info.source.sender.observe()
                         );
-                        outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
+                        self.retry_failed_session_enc(
+                            &mut outcome,
                             info,
                             enc_index,
                             enc_type,
                             terminal.unwrap_or(EncDecryptFailureReason::NoSession),
-                        );
-                        outcome.undecryptable |= self
-                            .handle_decrypt_failure(
-                                info,
-                                retry_reason.unwrap_or(RetryReason::NoSession),
-                                decrypt_fail_mode,
-                                ack_recipient,
-                            )
-                            .await;
+                            retry_reason.unwrap_or(RetryReason::NoSession),
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     } else if matches!(
                         e,
@@ -2208,21 +2273,17 @@ impl Client {
                             info.source.sender.observe()
                         );
 
-                        outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
+                        self.retry_failed_session_enc(
+                            &mut outcome,
                             info,
                             enc_index,
                             enc_type,
                             terminal.unwrap_or(failure),
-                        );
-                        outcome.undecryptable |= self
-                            .handle_decrypt_failure(
-                                info,
-                                retry_reason.unwrap_or(reason),
-                                decrypt_fail_mode,
-                                ack_recipient,
-                            )
-                            .await;
+                            retry_reason.unwrap_or(reason),
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidPreKeyId) {
                         // InvalidPreKeyId on a PreKeyMessage can also mean the
@@ -2277,21 +2338,17 @@ impl Client {
                         );
 
                         // Send retry receipt with fresh prekeys
-                        outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
+                        self.retry_failed_session_enc(
+                            &mut outcome,
                             info,
                             enc_index,
                             enc_type,
                             terminal.unwrap_or(EncDecryptFailureReason::UnknownPreKey),
-                        );
-                        outcome.undecryptable |= self
-                            .handle_decrypt_failure(
-                                info,
-                                retry_reason.unwrap_or(RetryReason::InvalidKeyId),
-                                decrypt_fail_mode,
-                                ack_recipient,
-                            )
-                            .await;
+                            retry_reason.unwrap_or(RetryReason::InvalidKeyId),
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidSignedPreKeyId) {
                         // WA Web classifies this as SignalRetryable; the catch-all
@@ -2305,35 +2362,32 @@ impl Client {
                             info.source.sender.observe()
                         );
 
-                        outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
+                        self.retry_failed_session_enc(
+                            &mut outcome,
                             info,
                             enc_index,
                             enc_type,
                             EncDecryptFailureReason::UnknownPreKey,
-                        );
-                        outcome.undecryptable |= self
-                            .handle_decrypt_failure(
-                                info,
-                                RetryReason::InvalidKeyId,
-                                decrypt_fail_mode,
-                                ack_recipient,
-                            )
-                            .await;
+                            RetryReason::InvalidKeyId,
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     } else if let Some(reason) = local_crypto_retry_reason(&e) {
                         // Our backend did not judge the ciphertext. Keep the
                         // same packet recoverable after a transient outage.
-                        outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
+                        self.retry_failed_session_enc(
+                            &mut outcome,
                             info,
                             enc_index,
                             enc_type,
                             EncDecryptFailureReason::LocalCryptoFailure,
-                        );
-                        outcome.undecryptable |= self
-                            .handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
-                            .await;
+                            reason,
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     } else {
                         // Catch-all → WA Web's UnhandledError nack (500).
@@ -2345,21 +2399,17 @@ impl Client {
                             e
                         );
                         outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(
-                            info,
-                            enc_index,
-                            enc_type,
-                            signal_error_reason(&e),
-                        );
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
+                        let report = self
+                            .nack_failed_enc(
+                                info,
+                                enc_index,
+                                enc_type,
+                                signal_error_reason(&e),
                                 decrypt_fail_mode,
+                                NackReason::UnhandledError,
                             )
                             .await;
-                        self.spawn_nack(info, NackReason::UnhandledError, None);
+                        outcome.report_undecryptable(report);
                         continue;
                     }
                 }
@@ -2489,6 +2539,10 @@ impl Client {
                             enc_type,
                             EncDecryptFailureReason::PlaintextUnusable,
                         );
+                        // As the session path does: the report, then the nack.
+                        // A refused report sends none and is owed to the
+                        // redelivery, whose skmsg decrypts as a duplicate.
+                        let _ = self.handle_plaintext_failure(info, decrypt_fail_mode).await;
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
@@ -2510,12 +2564,8 @@ impl Client {
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
                     // Reported before the expired-status early return: the enc
                     // failed either way, and only what happens next differs.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        EncDecryptFailureReason::NoSenderKey,
-                    );
+                    let failure = EncDecryptFailureReason::NoSenderKey;
+                    self.report_enc_decrypt_failure(info, enc_index, enc_type, failure);
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
@@ -2545,6 +2595,7 @@ impl Client {
 
                     self.handle_decrypt_failure(
                         info,
+                        failure,
                         retry_reason,
                         decrypt_fail_mode,
                         ack_recipient,
@@ -2556,19 +2607,15 @@ impl Client {
                     // classifier; only what it leaves unnamed is refined by the
                     // same predicate the retry decision uses, so the reported
                     // cause and the recovery the client chose cannot disagree.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        match signal_error_reason(&e) {
-                            EncDecryptFailureReason::SignalError
-                                if group_decrypt_retry_reason(&e).is_some() =>
-                            {
-                                EncDecryptFailureReason::InvalidMessage
-                            }
-                            reason => reason,
-                        },
-                    );
+                    let failure = match signal_error_reason(&e) {
+                        EncDecryptFailureReason::SignalError
+                            if group_decrypt_retry_reason(&e).is_some() =>
+                        {
+                            EncDecryptFailureReason::InvalidMessage
+                        }
+                        reason => reason,
+                    };
+                    self.report_enc_decrypt_failure(info, enc_index, enc_type, failure);
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
@@ -2590,8 +2637,14 @@ impl Client {
                             sender_address.observe(),
                             e
                         );
-                        self.handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
-                            .await;
+                        self.handle_decrypt_failure(
+                            info,
+                            failure,
+                            reason,
+                            decrypt_fail_mode,
+                            ack_recipient,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -2605,15 +2658,20 @@ impl Client {
                     );
                     // Always surface the failure to consumers; nack only non-status
                     // (status is acked by the should_ack gate) so the server drops
-                    // it from the offline queue.
-                    self.dispatch_undecryptable_event(
-                        Arc::clone(info),
-                        false,
-                        crate::types::events::UnavailableType::Unknown,
-                        decrypt_fail_mode,
-                    )
-                    .await;
-                    if !info.source.chat.is_status_broadcast() {
+                    // it from the offline queue. A refused report is not nacked,
+                    // so the server delivers it again.
+                    let reported = self
+                        .dispatch_undecryptable_event(
+                            Arc::clone(info),
+                            UndecryptableCause::enc(
+                                failure,
+                                UndecryptableRecovery::NoRequest,
+                                decrypt_fail_mode,
+                            ),
+                        )
+                        .await
+                        .is_ok();
+                    if reported && !info.source.chat.is_status_broadcast() {
                         self.spawn_nack(info, NackReason::UnhandledError, None);
                     }
                 }

@@ -3,6 +3,7 @@
 //! | Origin | Commit gate before ACK/receipt |
 //! | --- | --- |
 //! | Encrypted live/offline direct and group messages | [`InboundDurabilityHook`] |
+//! | Undecryptable stanzas | [`InboundDurabilityHook::on_undecryptable`], before the event, the retry receipt and the ACK |
 //! | Newsletter/channel messages | [`InboundDurabilityHook`], each as a batch of one |
 //! | PDO recovery | [`InboundDurabilityHook`], each as a batch of one, before its event |
 //! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
@@ -18,11 +19,15 @@ use crate::client::Client;
 use anyhow::Result;
 use std::sync::Arc;
 pub use wacore::types::events::InboundMessage;
+use wacore::types::events::{DecryptFailMode, EncDecryptFailureReason, UnavailableType};
+use wacore::types::message::MessageInfo;
 use waproto::whatsapp as wa;
 
 /// Hook invoked for every decrypted inbound user message, and every newsletter
-/// message, before it is acknowledged to the server, and for every message the
-/// primary phone recovers before it is published, turning the consumer from
+/// message, before it is acknowledged to the server, for every message the
+/// primary phone recovers before it is published, and for every message that
+/// produced no plaintext before it is answered
+/// ([`on_undecryptable`](Self::on_undecryptable)), turning the consumer from
 /// at-most-once into at-least-once delivery.
 ///
 /// The transport ack tells the server to drop the message from its offline
@@ -66,7 +71,9 @@ use waproto::whatsapp as wa;
 ///
 /// Scope and known limitations:
 /// - Covers end-to-end encrypted messages (1:1 and group), newsletter /
-///   broadcast channel messages, and messages the primary phone recovers.
+///   broadcast channel messages, messages the primary phone recovers, and,
+///   through [`on_undecryptable`](Self::on_undecryptable), messages that
+///   produced no plaintext.
 /// - A message the primary phone recovers (a PDO placeholder resend, the
 ///   answer to a message this device could not decrypt;
 ///   `info.unavailable_request_id` names the request when the reply carries
@@ -161,6 +168,143 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// process restart still requires the idempotent durable consumer described
     /// above.
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
+
+    /// Durably commit the report of one message that produced no plaintext,
+    /// before the client answers its stanza. Return `Ok(())` only after the
+    /// commit is durable; the SDK then dispatches
+    /// [`Event::UndecryptableMessage`](wacore::types::events::Event::UndecryptableMessage)
+    /// and does what [`UndecryptableCause::recovery`] says: the retry receipt
+    /// and then the ACK, a request to the primary phone and then the ACK, an
+    /// ACK or a nack, or nothing until the server delivers the stanza again.
+    /// Return `Err` to withhold all of it, the event included: the stanza is
+    /// neither acked nor nacked, so the server delivers it again and this
+    /// method is called again for it.
+    ///
+    /// It is called for every message that produced no plaintext: where an
+    /// `<enc>` of the stanza fails to decrypt (a Signal session or sender-key
+    /// message, or a bot reply's `msmsg`), where its plaintext proves
+    /// unusable (also one kept from a delivery cancelled before its plaintext
+    /// was checked, reported when the redelivery replays it), where no
+    /// `<enc>` of the stanza is one this client can decrypt (an unsupported
+    /// type or a malformed node), and for an `<unavailable>` stub the server
+    /// sends in place of ciphertext. A stanza whose message attributes don't
+    /// parse has no `info` to report and is nacked as before. Within the
+    /// [`CacheConfig::undecryptable_dispatched`](crate::CacheConfig::undecryptable_dispatched)
+    /// window a message is reported until a call returns `Ok`: a later delivery
+    /// of a message this method accepted is answered without another call or
+    /// event (as is a further failed `<enc>` of the same stanza), while one it
+    /// refused is reported again. A copy that arrives while a call for the
+    /// same message still runs (a redelivery on a new connection while the
+    /// previous connection's copy is in this method) waits for that call and
+    /// then follows it: answered without a call after `Ok`, reported in a
+    /// call of its own after `Err`. Commit a placeholder for
+    /// `(info.source.chat, info.source.sender, info.id)` that the real message
+    /// replaces when a retry, the primary phone or the sender's own resend
+    /// brings it, and be idempotent: after the window, after a restart, or
+    /// when the commit landed and the answer did not, the same message is
+    /// reported again.
+    ///
+    /// When the `<enc>` had decrypted and only its plaintext was unusable, its
+    /// redelivery cannot fail the same way again (the ratchet has moved on and
+    /// it decrypts as a duplicate). Before this call the client therefore
+    /// records the report in the message's pending-inbound row, as a
+    /// decrypted message is buffered before its hook runs, and clears it after
+    /// `Ok`. After an `Err` it stays owed, across reconnects, the end of this
+    /// Client and a restart: when the stanza comes back, before any of it is
+    /// processed, this method is called with that delivery's `info`, the same
+    /// `failure` and `decrypt_fail_mode`, and
+    /// [`UndecryptableRecovery::NoRequest`] (nothing asks for the message
+    /// again; the stanza is then processed and answered as its content says).
+    /// The row expires with the other pending-inbound rows. A
+    /// `status@broadcast` stanza owes nothing: it was acked when it arrived and
+    /// is not delivered again.
+    ///
+    /// The rules of [`on_messages`](Self::on_messages) apply: this runs in the
+    /// receive pipeline, possibly while the client holds the sender's Signal
+    /// session lock and a processing permit, so never call the client for this
+    /// sender from inside it, and Signal maintenance it reaches refuses. A
+    /// `status@broadcast` stanza is acked when it arrives, without waiting for
+    /// this call, as for `on_messages`, so an `Err` withholds what follows the
+    /// report (the event, the retry receipt, the request to the phone or the
+    /// nack), not the ack. The default commits nothing and returns `Ok(())`,
+    /// which answers the stanza as a client without a hook does.
+    async fn on_undecryptable(
+        &self,
+        _client: Arc<Client>,
+        _info: &MessageInfo,
+        _cause: UndecryptableCause,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// What [`InboundDurabilityHook::on_undecryptable`] is told about a message
+/// that produced no plaintext: what failed, and what the client does once the
+/// hook returns `Ok`. A host's tests build one with
+/// [`UndecryptableCause::builder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
+pub struct UndecryptableCause {
+    /// What produced no plaintext.
+    pub failure: UndecryptableFailure,
+    /// What the client does after `Ok`.
+    pub recovery: UndecryptableRecovery,
+    /// The sender's `decrypt-fail` attribute: `Hide` marks a message whose
+    /// failure the sender asks not to show (an add-on, a fan-out copy), as the
+    /// event's own field does.
+    pub decrypt_fail_mode: DecryptFailMode,
+}
+
+/// What produced no plaintext for an
+/// [`InboundDurabilityHook::on_undecryptable`] report. Later versions may add
+/// kinds: match it with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UndecryptableFailure {
+    /// The server sent an `<unavailable>` stub of this kind in place of the
+    /// ciphertext (a fan-out this device was not encrypted for).
+    Unavailable(UnavailableType),
+    /// An `<enc>` of the stanza produced no plaintext, for the reason the
+    /// client gives it in
+    /// [`Event::EncDecryptFailed`](wacore::types::events::Event::EncDecryptFailed).
+    Enc(EncDecryptFailureReason),
+}
+
+/// What the client does once [`InboundDurabilityHook::on_undecryptable`]
+/// returns `Ok`. Later versions may add kinds: match it with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UndecryptableRecovery {
+    /// A retry receipt asks the sender to encrypt the message again, then the
+    /// stanza is acked. The first retry also asks the primary phone for the
+    /// message; at the client's retry cap only the phone is asked, and a
+    /// [`DecryptFailureAdmission`](crate::DecryptFailureAdmission) policy can
+    /// have the stanza acked without a retry.
+    RetryReceipt,
+    /// The primary phone is asked for the message (a placeholder resend), then
+    /// the stanza is acked.
+    PlaceholderResend,
+    /// The stanza is left unanswered, so the server delivers it again and the
+    /// client processes it again then.
+    Redelivery,
+    /// The stanza is acked or nacked and nothing asks for the message again:
+    /// only the sender resending it on its own brings it back.
+    NoRequest,
+}
+
+impl UndecryptableCause {
+    /// A failed `<enc>`.
+    pub(crate) const fn enc(
+        reason: EncDecryptFailureReason,
+        recovery: UndecryptableRecovery,
+        decrypt_fail_mode: DecryptFailMode,
+    ) -> Self {
+        Self {
+            failure: UndecryptableFailure::Enc(reason),
+            recovery,
+            decrypt_fail_mode,
+        }
+    }
 }
 
 /// Optional capture of history-sync bytes before attempting their receipt.

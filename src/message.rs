@@ -180,6 +180,13 @@ pub(crate) struct ClassifiedMessage {
 pub(crate) struct SessionBatchOutcome {
     decrypted: bool,
     duplicate: bool,
+    /// The batch settled the message's undecryptable report for this
+    /// delivery: a failed `<enc>` was answered through
+    /// `handle_decrypt_failure`, a report the batch nacks dispatched the event,
+    /// or the inbound durability hook refused a report (the stanza is then
+    /// left unanswered). Nothing after the batch reports or answers it then.
+    /// A nacked report whose event an earlier delivery dispatched leaves it
+    /// unset.
     undecryptable: bool,
     dispatched: bool,
     skdm_only: bool,
@@ -189,6 +196,21 @@ pub(crate) struct SessionBatchOutcome {
     interrupted: bool,
     /// Finish projecting earlier plaintexts, then abandon the remaining stanza.
     recovery_deferred: bool,
+    /// Why an `<enc>` failed when the batch left its message's undecryptable
+    /// report to the caller (local storage failed): the reason the caller
+    /// reports.
+    unreported_failure: Option<EncDecryptFailureReason>,
+}
+
+impl SessionBatchOutcome {
+    /// Fold one undecryptable report into the batch. A refused report also
+    /// counts as reported, so nothing after the batch reports it again.
+    fn report_undecryptable(&mut self, report: Result<bool, retry::HookRefused>) {
+        match report {
+            Ok(dispatched) => self.undecryptable |= dispatched,
+            Err(retry::HookRefused) => self.undecryptable = true,
+        }
+    }
 }
 
 /// Outcome of a PN→LID migration retry decrypt. On `Decrypted` the plaintext

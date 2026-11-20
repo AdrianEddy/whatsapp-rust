@@ -8,7 +8,9 @@
 //! Live messages bypass accumulation and commit as a batch of one, which is
 //! also WA Web behavior (the same pipeline with an immediate flush).
 
-use super::raw_pending::{MAX_PENDING_BYTES, Occurrence, PendingDelivery, PendingJournal};
+use super::raw_pending::{
+    MAX_PENDING_BYTES, Occurrence, OwedReport, PendingDelivery, PendingJournal,
+};
 use super::*;
 use crate::flush_scope::DrainOutcome;
 use portable_atomic::AtomicU64;
@@ -53,13 +55,33 @@ impl Client {
         hook: &'a dyn crate::types::durability_hook::InboundDurabilityHook,
         batch: &'a [InboundMessage],
     ) -> impl Future<Output = anyhow::Result<()>> + 'a {
-        let client = std::ptr::from_ref(self.as_ref()) as usize;
-        let mut hook_future = hook.on_messages(Arc::clone(self), batch);
+        self.poll_inside_inbound_hook(hook.on_messages(Arc::clone(self), batch))
+    }
+
+    /// `hook.on_undecryptable(info, cause)`, under the marker
+    /// [`Self::call_inbound_hook`] sets.
+    pub(crate) fn call_undecryptable_hook<'a>(
+        self: &'a Arc<Self>,
+        hook: &'a dyn crate::types::durability_hook::InboundDurabilityHook,
+        info: &'a MessageInfo,
+        cause: crate::types::durability_hook::UndecryptableCause,
+    ) -> impl Future<Output = anyhow::Result<()>> + 'a {
+        self.poll_inside_inbound_hook(hook.on_undecryptable(Arc::clone(self), info, cause))
+    }
+
+    fn poll_inside_inbound_hook<'a, F>(
+        &self,
+        mut hook_future: F,
+    ) -> impl Future<Output = F::Output> + 'a
+    where
+        F: Future + Unpin + 'a,
+    {
+        let client = std::ptr::from_ref(self) as usize;
         std::future::poll_fn(move |cx| {
             let previous = INBOUND_HOOK_CLIENT.replace(Some(client));
             let _restore =
                 scopeguard::guard(previous, |previous| INBOUND_HOOK_CLIENT.set(previous));
-            hook_future.as_mut().poll(cx)
+            std::pin::Pin::new(&mut hook_future).poll(cx)
         })
     }
 }
@@ -471,6 +493,9 @@ struct StoredPendingGroup {
     id: String,
     revision: PendingInboundRevision,
     complete: bool,
+    /// The undecryptable report the row also owes, which outlives the
+    /// cleanup of what the batch committed.
+    owed: Option<OwedReport>,
 }
 
 fn has_physical_aliases(rows: &[StoredPendingGroup]) -> bool {
@@ -558,6 +583,91 @@ impl Client {
             id: &info.id,
         };
         lookup_pending_record(&backend, key, info.source.chat.is_group(), lease).await
+    }
+
+    /// Owe `owed` in the pending-journal row of `info`'s message, before the
+    /// inbound hook is asked to commit the report: the `<enc>`'s ratchet
+    /// advance is already in the Signal cache, and once a flush makes it
+    /// durable the redelivery decrypts as a duplicate and only this row says a
+    /// report is owed. The row's occurrences stay, and a report already owed
+    /// stays as it was.
+    pub(super) async fn owe_undecryptable_report(
+        &self,
+        info: &MessageInfo,
+        owed: OwedReport,
+    ) -> anyhow::Result<()> {
+        self.rewrite_owed_report(info, Some(owed)).await
+    }
+
+    /// The report owed for `info`'s message was made: drop it from the row,
+    /// and the row with it when it held nothing else.
+    pub(super) async fn settle_owed_undecryptable_report(
+        &self,
+        info: &MessageInfo,
+    ) -> anyhow::Result<()> {
+        self.rewrite_owed_report(info, None).await
+    }
+
+    async fn rewrite_owed_report(
+        &self,
+        info: &MessageInfo,
+        owed: Option<OwedReport>,
+    ) -> anyhow::Result<()> {
+        // Read and conditional write under one mutation owner, as the batch's
+        // row writes; never held while consumer code runs.
+        let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
+        let lease = PendingInboundLease::new(owner);
+        let backend = self.persistence_manager.backend();
+        let chat = info.source.chat.to_string();
+        let arrival = info.source.sender.to_string();
+        let found = lookup_pending_record(
+            &backend,
+            PendingInboundKey {
+                chat: &chat,
+                sender: &arrival,
+                id: &info.id,
+            },
+            info.source.chat.is_group(),
+            lease.clone(),
+        )
+        .await?;
+        let (sender, expected, mut journal) = match found {
+            Some((sender, record)) => {
+                let expected = record.revision();
+                let (bytes, _read_lease) = record.into_bytes();
+                (sender, expected, PendingJournal::decode(bytes)?)
+            }
+            None if owed.is_none() => return Ok(()),
+            None => (
+                Self::pending_sender(info),
+                PendingInboundRevision::missing(),
+                PendingJournal::default(),
+            ),
+        };
+        if journal.owed.is_some() == owed.is_some() {
+            return Ok(());
+        }
+        journal.owed = owed;
+        let key = PendingInboundKey {
+            chat: &chat,
+            sender: &sender,
+            id: &info.id,
+        };
+        let mutation = if journal.occurrences.is_empty() && owed.is_none() {
+            backend
+                .delete_pending_inbound_if(key, expected, MAX_PENDING_BYTES, lease)
+                .await?
+        } else {
+            let payload = PendingInboundPayload::new(journal.encode()?, lease);
+            backend
+                .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)
+                .await?
+        };
+        anyhow::ensure!(
+            mutation == PendingInboundMutation::Applied,
+            "pending owed report revision conflict"
+        );
+        Ok(())
     }
 
     async fn persist_pending_group(
@@ -726,6 +836,7 @@ impl Client {
                 }
                 None => PendingJournal::default(),
             };
+            let owed = journal.owed;
             let (encoded, complete) =
                 self.encode_pending_deliveries(journal, deliveries, is_drain, &owner)?;
             let payload = PendingInboundPayload::new(encoded, lease.clone());
@@ -743,6 +854,7 @@ impl Client {
                 id,
                 revision,
                 complete,
+                owed,
             });
         }
         Ok(stored)
@@ -832,27 +944,7 @@ impl Client {
                 sender: &row.sender,
                 id: &row.id,
             };
-            let result = match backend
-                .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
-                .await
-            {
-                Ok(PendingInboundMutation::Applied) => Ok(()),
-                Ok(_) => Err(anyhow::anyhow!(
-                    "pending occurrence cleanup revision conflict"
-                )),
-                Err(error) => {
-                    // An error can follow an applied deletion. Verify absence
-                    // under the same owner, and never delete a successor.
-                    match backend
-                        .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
-                        .await
-                    {
-                        Ok(None) => Ok(()),
-                        Ok(Some(_)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                    }
-                }
-            };
+            let result = Self::clean_committed_row(&*backend, key, row, &lease).await;
             if let Err(error) = result {
                 // Retain ACK failure, but clean other owned revisions: leaving
                 // both physical aliases would make bounded replay ambiguous.
@@ -862,6 +954,53 @@ impl Client {
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    /// Remove what a batch committed from its row. An undecryptable report
+    /// the row also owes stays, alone in the row, for the stanza's redelivery.
+    async fn clean_committed_row(
+        backend: &dyn crate::store::traits::Backend,
+        key: PendingInboundKey<'_>,
+        row: &StoredPendingGroup,
+        lease: &PendingInboundLease,
+    ) -> anyhow::Result<()> {
+        let (mutation, remaining) = match row.owed {
+            None => (
+                backend
+                    .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
+                    .await,
+                None,
+            ),
+            Some(owed) => {
+                let payload = PendingInboundPayload::new(
+                    PendingJournal::owing(owed).encode()?,
+                    lease.clone(),
+                );
+                let remaining = Some(payload.revision());
+                (
+                    backend
+                        .replace_pending_inbound_if(key, row.revision, payload, MAX_PENDING_BYTES)
+                        .await,
+                    remaining,
+                )
+            }
+        };
+        match mutation {
+            Ok(PendingInboundMutation::Applied) => Ok(()),
+            Ok(_) => Err(anyhow::anyhow!(
+                "pending occurrence cleanup revision conflict"
+            )),
+            // An error can follow an applied mutation. Verify what it left
+            // under the same owner, and never touch a successor.
+            Err(error) => match backend
+                .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
+                .await
+            {
+                Ok(found) if found.as_ref().map(|record| record.revision()) == remaining => Ok(()),
+                Ok(_) => Err(error.into()),
+                Err(error) => Err(error.into()),
+            },
         }
     }
 }
@@ -907,6 +1046,12 @@ impl Client {
         (epoch, ticket)
     }
 
+    /// Before the arrival `info` decrypts, finish what earlier deliveries of
+    /// its message left: commit their retained and journaled occurrences, and
+    /// make the undecryptable report a refused delivery owes, which this copy
+    /// can't make by itself (its `<enc>` decrypts as a duplicate). `Err` when
+    /// that could not be done, a hook refusal included: the arrival then stays
+    /// unanswered.
     pub(super) async fn persist_live_retained_before_decrypt(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
@@ -931,6 +1076,20 @@ impl Client {
         let journal = PendingJournal::decode(bytes)?;
         let storage_sender: Arc<str> = sender.into();
         drop(read_lease);
+        if let Some(owed) = journal.owed {
+            // Reported under this arrival's `info`, before anything of it is
+            // processed or answered; settled once the hook committed it.
+            anyhow::ensure!(
+                self.dispatch_undecryptable_event(Arc::clone(info), owed.cause())
+                    .await
+                    .is_ok(),
+                "owed undecryptable report has not been committed before decrypt"
+            );
+            self.settle_owed_undecryptable_report(info).await?;
+        }
+        if journal.occurrences.is_empty() {
+            return Ok(());
+        }
         let mut predecessor = Vec::with_capacity(journal.occurrences.len());
         for (position, entry) in journal.occurrences.into_iter().enumerate() {
             let position = entry.index.map_or(position, |index| index as usize);

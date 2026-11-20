@@ -506,7 +506,10 @@ pub use types::connect_admission::ConnectAdmission;
 pub use types::decrypt_failure_admission::{
     DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,
 };
-pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
+pub use types::durability_hook::{
+    HistorySyncCaptureHook, InboundDurabilityHook, UndecryptableCause, UndecryptableFailure,
+    UndecryptableRecovery,
+};
 pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 #[cfg(feature = "generated-group-notifications")]
 pub use types::group_notification_facts::{

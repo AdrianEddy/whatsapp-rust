@@ -1,6 +1,7 @@
 //! Live writes own plaintext independently of the offline batch and reconnect reset.
 
 use super::raw_pending::{MAX_PENDING_BYTES, PendingDelivery, StanzaOrigin};
+use crate::types::events::DecryptFailMode;
 use crate::types::message::MessageInfo;
 use std::sync::{Arc, Mutex};
 use wacore::stats::HeapSize;
@@ -52,6 +53,9 @@ struct State {
 struct Reservation {
     origin: StanzaOrigin,
     charge: Arc<Charge>,
+    /// The stanza's `decrypt-fail` mode, which its retained plaintexts keep
+    /// for a replay that reports one of them undecryptable.
+    decrypt_fail_mode: DecryptFailMode,
     receiving: bool,
     entries: Vec<RetainedDelivery>,
     raw: Vec<RawRetained>,
@@ -163,6 +167,7 @@ pub(super) struct RawRetained {
     pub plaintext: bytes::Bytes,
     pub enc_type: &'static str,
     pub padding_version: u8,
+    pub decrypt_fail_mode: DecryptFailMode,
     pub charge: Arc<Charge>,
 }
 pub(super) struct Admission {
@@ -211,6 +216,10 @@ impl Admission {
 struct ReceiptState {
     closed: bool,
     failed: bool,
+    /// The inbound durability hook refused an undecryptable report of this
+    /// arrival: nothing may answer the stanza on this delivery, its ACK
+    /// (`failed` is set with it) and a sibling `<enc>`'s nack included.
+    answers_withheld: bool,
     requested: bool,
     sent: bool,
     // A queued replay may use an older producer origin with this arrival's
@@ -256,6 +265,11 @@ pub(super) struct ReceiptProducer(Arc<ReceiptScope>, Arc<MessageInfo>);
 impl ReceiptProducer {
     pub fn info(&self) -> &Arc<MessageInfo> {
         &self.1
+    }
+    /// Whether a refused undecryptable report withholds every answer of this
+    /// arrival ([`LiveRetention::withhold_answers`]).
+    pub fn answers_withheld(&self) -> bool {
+        lock(&self.0.state).answers_withheld
     }
     pub fn finish(&self) -> bool {
         let mut state = lock(&self.0.state);
@@ -361,6 +375,18 @@ impl LiveRetention {
             lock(&scope.state).failed = true;
         }
     }
+    /// The inbound durability hook refused an undecryptable report of the
+    /// arrival `info`: withhold its ACK and every other answer of the stanza
+    /// for this delivery, so the server delivers it again. Nothing to do for
+    /// an arrival without a receipt scope (one refused before its scope
+    /// opened returns at once, unanswered).
+    pub fn withhold_answers(&self, info: &Arc<MessageInfo>) {
+        if let Some(scope) = self.receipt_for(info) {
+            let mut state = lock(&scope.state);
+            state.failed = true;
+            state.answers_withheld = true;
+        }
+    }
     pub fn defer_receipt(&self, info: &Arc<MessageInfo>) -> bool {
         self.receipt_for(info).is_some_and(|scope| scope.defer())
     }
@@ -371,7 +397,7 @@ impl LiveRetention {
         wire_bytes: usize,
         slots: usize,
     ) -> anyhow::Result<Admission> {
-        self.reserve_sized(origin, wire_bytes, slots, 0)
+        self.reserve_sized(origin, wire_bytes, slots, 0, DecryptFailMode::Show)
     }
 
     #[inline(never)]
@@ -381,8 +407,15 @@ impl LiveRetention {
         wire_bytes: usize,
         slots: usize,
         info: &MessageInfo,
+        decrypt_fail_mode: DecryptFailMode,
     ) -> anyhow::Result<Admission> {
-        self.reserve_sized(origin, wire_bytes, slots, info_bytes(info))
+        self.reserve_sized(
+            origin,
+            wire_bytes,
+            slots,
+            info_bytes(info),
+            decrypt_fail_mode,
+        )
     }
 
     fn reserve_sized(
@@ -391,6 +424,7 @@ impl LiveRetention {
         wire_bytes: usize,
         slots: usize,
         metadata: usize,
+        decrypt_fail_mode: DecryptFailMode,
     ) -> anyhow::Result<Admission> {
         // Canonical encoding may expand packed scalar fields to unpacked tags.
         // Message's repeated scalar tags occupy at most two bytes, so a one-byte
@@ -411,6 +445,7 @@ impl LiveRetention {
         state.reservations.push(Reservation {
             origin,
             charge,
+            decrypt_fail_mode,
             receiving: true,
             entries: Vec::new(),
             raw: Vec::new(),
@@ -512,6 +547,10 @@ impl LiveRetention {
                         .origin
                         .map_or_else(StanzaOrigin::new, |origin| origin.stanza),
                     charge,
+                    // Never read: plaintexts are staged into the admission of
+                    // the stanza that decrypted them, never into a reservation
+                    // made here for a delivery whose stanza is done.
+                    decrypt_fail_mode: DecryptFailMode::Show,
                     receiving: false,
                     entries: Vec::new(),
                     raw: Vec::new(),
@@ -658,6 +697,7 @@ impl LiveRetention {
             plaintext,
             enc_type: slot.1,
             padding_version: slot.2,
+            decrypt_fail_mode: reservation.decrypt_fail_mode,
             charge: Arc::clone(&reservation.charge),
         });
     }
@@ -820,7 +860,7 @@ mod tests {
         let admissions: Vec<_> = (0..256)
             .map(|_| {
                 retention
-                    .reserve_with_info(StanzaOrigin::new(), 0, 0, &info)
+                    .reserve_with_info(StanzaOrigin::new(), 0, 0, &info, DecryptFailMode::Show)
                     .unwrap()
             })
             .collect();
@@ -841,7 +881,7 @@ mod tests {
         let info = Arc::new(MessageInfo::default());
         let producer = StanzaOrigin::new();
         let admission = retention
-            .reserve_with_info(producer, 1024, 1, &info)
+            .reserve_with_info(producer, 1024, 1, &info, DecryptFailMode::Show)
             .unwrap();
         let receipt = retention.begin_receipts(&info).unwrap();
         retention.reclaim_idle_capacity();
@@ -863,7 +903,7 @@ mod tests {
         let info = Arc::new(MessageInfo::default());
         let producer = StanzaOrigin::new();
         let admission = retention
-            .reserve_with_info(producer, 1024, 2, &info)
+            .reserve_with_info(producer, 1024, 2, &info, DecryptFailMode::Show)
             .unwrap();
         let plaintext = vec![0; 512];
         retention.stage(&info, producer, (0, "msg", 3), &plaintext);
@@ -909,7 +949,7 @@ mod tests {
         let backing = lock(&retention.budget).bytes;
         drop(bare);
         let admission = retention
-            .reserve_with_info(StanzaOrigin::new(), 1024, 3, &info)
+            .reserve_with_info(StanzaOrigin::new(), 1024, 3, &info, DecryptFailMode::Show)
             .unwrap();
         assert_eq!(lock(&retention.budget).bytes, backing + info_bytes(&info));
         drop(admission);
@@ -919,7 +959,7 @@ mod tests {
         ];
         assert!(
             retention
-                .reserve_with_info(StanzaOrigin::new(), 1, 1, &info)
+                .reserve_with_info(StanzaOrigin::new(), 1, 1, &info, DecryptFailMode::Show)
                 .is_err()
         );
         assert!(lock(&retention.state).reservations.is_empty());

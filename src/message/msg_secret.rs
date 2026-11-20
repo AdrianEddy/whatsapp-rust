@@ -492,14 +492,21 @@ impl Client {
 
     /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
     /// outbound `messageSecret` we persisted at send time and runs the
-    /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
-    /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
+    /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. A failure is
+    /// reported as an undecryptable message and then nacked (495 for a
+    /// missing secret or a GCM tag failure, 487 for a malformed proto), once
+    /// the inbound durability hook accepted the report; a refused report
+    /// sends nothing, and its redelivery opens the payload again (no ratchet
+    /// moved, the secret is kept). A secret our own store would not look up
+    /// is not nacked: the stanza is left for its redelivery.
     pub(super) async fn handle_msmsg_payload_in_scope(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         payload: EncPayload,
         producer: raw_pending::StanzaOrigin,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) {
+        use crate::types::durability_hook::{UndecryptableCause, UndecryptableRecovery};
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
@@ -516,13 +523,16 @@ impl Client {
                     "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
                     info.id
                 );
-                self.report_enc_decrypt_failure(
-                    info,
-                    enc_index,
-                    enc_type,
-                    EncDecryptFailureReason::MalformedCiphertext,
-                );
-                self.spawn_nack(info, NackReason::ParsingError, None);
+                let _ = self
+                    .nack_failed_enc(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::MalformedCiphertext,
+                        decrypt_fail_mode,
+                        NackReason::ParsingError,
+                    )
+                    .await;
                 return;
             }
         };
@@ -533,13 +543,16 @@ impl Client {
                 "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
                 info.id
             );
-            self.report_enc_decrypt_failure(
-                info,
-                enc_index,
-                enc_type,
-                EncDecryptFailureReason::MalformedCiphertext,
-            );
-            self.spawn_nack(info, NackReason::ParsingError, None);
+            let _ = self
+                .nack_failed_enc(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::MalformedCiphertext,
+                    decrypt_fail_mode,
+                    NackReason::ParsingError,
+                )
+                .await;
             return;
         };
 
@@ -550,13 +563,16 @@ impl Client {
             Some(j) => j,
             None => {
                 log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
-                self.report_enc_decrypt_failure(
-                    info,
-                    enc_index,
-                    enc_type,
-                    EncDecryptFailureReason::NoMessageSecret,
-                );
-                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                let _ = self
+                    .nack_failed_enc(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::NoMessageSecret,
+                        decrypt_fail_mode,
+                        NackReason::MissingMessageSecret,
+                    )
+                    .await;
                 return;
             }
         };
@@ -582,13 +598,16 @@ impl Client {
                     "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
                     info.id
                 );
-                self.report_enc_decrypt_failure(
-                    info,
-                    enc_index,
-                    enc_type,
-                    EncDecryptFailureReason::NoMessageSecret,
-                );
-                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                let _ = self
+                    .nack_failed_enc(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::NoMessageSecret,
+                        decrypt_fail_mode,
+                        NackReason::MissingMessageSecret,
+                    )
+                    .await;
                 return;
             }
         };
@@ -696,17 +715,34 @@ impl Client {
                             "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
                             info.id
                         );
-                        self.report_enc_decrypt_failure(
-                            info,
-                            enc_index,
-                            enc_type,
-                            if lookup_failed {
-                                EncDecryptFailureReason::StorageFailure
-                            } else {
-                                EncDecryptFailureReason::NoMessageSecret
-                            },
-                        );
-                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        if lookup_failed {
+                            // Our store would not answer, which its next read
+                            // may: reported, then left for the redelivery
+                            // rather than nacked away.
+                            let failure = EncDecryptFailureReason::StorageFailure;
+                            self.report_enc_decrypt_failure(info, enc_index, enc_type, failure);
+                            let _ = self
+                                .dispatch_undecryptable_event(
+                                    Arc::clone(info),
+                                    UndecryptableCause::enc(
+                                        failure,
+                                        UndecryptableRecovery::Redelivery,
+                                        decrypt_fail_mode,
+                                    ),
+                                )
+                                .await;
+                        } else {
+                            let _ = self
+                                .nack_failed_enc(
+                                    info,
+                                    enc_index,
+                                    enc_type,
+                                    EncDecryptFailureReason::NoMessageSecret,
+                                    decrypt_fail_mode,
+                                    NackReason::MissingMessageSecret,
+                                )
+                                .await;
+                        }
                         return;
                     }
                 }
@@ -771,13 +807,16 @@ impl Client {
                         // Both attempts see the same iv/payload, so a shape
                         // rejection is identical on either and the primary
                         // error decides.
-                        self.report_enc_decrypt_failure(
-                            info,
-                            enc_index,
-                            enc_type,
-                            msmsg_failure_reason(&primary_err),
-                        );
-                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        let _ = self
+                            .nack_failed_enc(
+                                info,
+                                enc_index,
+                                enc_type,
+                                msmsg_failure_reason(&primary_err),
+                                decrypt_fail_mode,
+                                NackReason::MissingMessageSecret,
+                            )
+                            .await;
                         return;
                     }
                 },
@@ -786,13 +825,16 @@ impl Client {
                         "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
                         info.id
                     );
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        msmsg_failure_reason(&primary_err),
-                    );
-                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    let _ = self
+                        .nack_failed_enc(
+                            info,
+                            enc_index,
+                            enc_type,
+                            msmsg_failure_reason(&primary_err),
+                            decrypt_fail_mode,
+                            NackReason::MissingMessageSecret,
+                        )
+                        .await;
                     return;
                 }
             },
@@ -829,17 +871,21 @@ impl Client {
                     "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
                     info.id
                 );
-                self.report_enc_decrypt_failure(
-                    info,
-                    enc_index,
-                    enc_type,
-                    EncDecryptFailureReason::PlaintextUnusable,
-                );
-                self.spawn_nack(info, NackReason::ParsingError, None);
+                // Released either way: a redelivery opens the payload again.
                 self.finish_retained_raw(raw_pending::DeliveryOrigin {
                     stanza: producer,
                     position: enc_index,
                 });
+                let _ = self
+                    .nack_failed_enc(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::PlaintextUnusable,
+                        decrypt_fail_mode,
+                        NackReason::ParsingError,
+                    )
+                    .await;
                 return;
             }
         };

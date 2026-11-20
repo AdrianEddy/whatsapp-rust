@@ -5493,9 +5493,10 @@ async fn test_undecryptable_fires_before_retry_task() {
             .is_none()
     );
 
-    let _ = client
+    client
         .handle_decrypt_failure(
             &info,
+            EncDecryptFailureReason::UnknownPreKey,
             RetryReason::InvalidKeyId,
             DecryptFailMode::Show,
             None,
@@ -5549,8 +5550,14 @@ async fn test_undecryptable_dedup_is_atomic() {
         let c = Arc::clone(&client);
         let i = Arc::clone(&info);
         handles.push(tokio::spawn(async move {
-            c.handle_decrypt_failure(&i, RetryReason::InvalidKeyId, DecryptFailMode::Show, None)
-                .await;
+            c.handle_decrypt_failure(
+                &i,
+                EncDecryptFailureReason::UnknownPreKey,
+                RetryReason::InvalidKeyId,
+                DecryptFailMode::Show,
+                None,
+            )
+            .await;
         }));
     }
     for h in handles {
@@ -5578,17 +5585,19 @@ async fn test_undecryptable_deduped_across_resends() {
         "85010891714716@lid",
     ));
 
-    let _ = client
+    client
         .handle_decrypt_failure(
             &info,
+            EncDecryptFailureReason::UnknownPreKey,
             RetryReason::InvalidKeyId,
             DecryptFailMode::Show,
             None,
         )
         .await;
-    let _ = client
+    client
         .handle_decrypt_failure(
             &info,
+            EncDecryptFailureReason::UnknownPreKey,
             RetryReason::InvalidKeyId,
             DecryptFailMode::Show,
             None,
@@ -7760,7 +7769,13 @@ async fn decrypt_failure_emits_transport_ack() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Hide,
+            None,
+        )
         .await;
 
     // retry + ack are detached spawns; poll the wire until the ack appears.
@@ -7809,7 +7824,13 @@ async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Hide,
+            None,
+        )
         .await;
 
     let mut found = None;
@@ -7871,7 +7892,13 @@ async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Hide,
+            None,
+        )
         .await;
 
     // Positive: the message IS cleared, via the bot-invoke-response bare
@@ -7919,7 +7946,13 @@ async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
     });
     transport.fail_next_sends(1);
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.failed_sends() == 0 {
@@ -7953,7 +7986,13 @@ async fn decrypt_failure_sends_retry_before_ack() {
     // BadMac (not NoSession) so the retry receipt carries no keys and needs
     // no device account in this harness.
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
 
     let find = |tag: &str, retry: bool| -> Option<usize> {
@@ -8010,7 +8049,13 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     });
 
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
 
     // status failures are acked from the flushed task (not just the detached
@@ -16891,27 +16936,36 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
     let first = client
         .dispatch_undecryptable_event(
             info_for("111111111111111@lid"),
-            false,
-            crate::types::events::UnavailableType::Unknown,
-            DecryptFailMode::Show,
+            crate::UndecryptableCause::enc(
+                EncDecryptFailureReason::SignalError,
+                crate::UndecryptableRecovery::NoRequest,
+                DecryptFailMode::Show,
+            ),
         )
-        .await;
+        .await
+        .expect("no hook is registered to refuse");
     let second = client
         .dispatch_undecryptable_event(
             info_for("222222222222222@lid"),
-            false,
-            crate::types::events::UnavailableType::Unknown,
-            DecryptFailMode::Show,
+            crate::UndecryptableCause::enc(
+                EncDecryptFailureReason::SignalError,
+                crate::UndecryptableRecovery::NoRequest,
+                DecryptFailMode::Show,
+            ),
         )
-        .await;
+        .await
+        .expect("no hook is registered to refuse");
     let repeat = client
         .dispatch_undecryptable_event(
             info_for("111111111111111@lid"),
-            false,
-            crate::types::events::UnavailableType::Unknown,
-            DecryptFailMode::Show,
+            crate::UndecryptableCause::enc(
+                EncDecryptFailureReason::SignalError,
+                crate::UndecryptableRecovery::NoRequest,
+                DecryptFailMode::Show,
+            ),
         )
-        .await;
+        .await
+        .expect("no hook is registered to refuse");
 
     assert!(first, "the first sender's message is dispatched");
     assert!(
@@ -16956,19 +17010,25 @@ async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
     let first = client
         .dispatch_undecryptable_event(
             info_for(pn),
-            false,
-            crate::types::events::UnavailableType::Unknown,
-            DecryptFailMode::Show,
+            crate::UndecryptableCause::enc(
+                EncDecryptFailureReason::SignalError,
+                crate::UndecryptableRecovery::NoRequest,
+                DecryptFailMode::Show,
+            ),
         )
-        .await;
+        .await
+        .expect("no hook is registered to refuse");
     let switched = client
         .dispatch_undecryptable_event(
             info_for(lid),
-            false,
-            crate::types::events::UnavailableType::Unknown,
-            DecryptFailMode::Show,
+            crate::UndecryptableCause::enc(
+                EncDecryptFailureReason::SignalError,
+                crate::UndecryptableRecovery::NoRequest,
+                DecryptFailMode::Show,
+            ),
         )
-        .await;
+        .await
+        .expect("no hook is registered to refuse");
 
     assert!(first, "the first delivery is dispatched");
     assert!(
@@ -22431,6 +22491,7 @@ async fn raw_pending_multipart_replay_keeps_original_shared_metadata() {
             payloads.iter().map(Vec::len).sum(),
             payloads.len(),
             &original,
+            DecryptFailMode::Show,
         )
         .unwrap();
     for (index, payload) in payloads.iter().enumerate() {
@@ -24276,7 +24337,13 @@ async fn run_decrypt_failure_with_policy(
     });
     // BadMac so the retry receipt carries no keys (no device account needed).
     client
-        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show, None)
+        .handle_decrypt_failure(
+            &info,
+            EncDecryptFailureReason::BadMac,
+            RetryReason::BadMac,
+            DecryptFailMode::Show,
+            None,
+        )
         .await;
 
     let retry_sent = |frames: &[bytes::Bytes]| {

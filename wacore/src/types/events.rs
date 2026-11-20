@@ -1094,6 +1094,14 @@ pub enum Event {
     /// send → server-accept latency and surface nack codes programmatically
     /// (today nacks are only visible as `warn!` logs).
     ServerAck(ServerAck),
+    /// A message that produced no plaintext: an `<enc>` that failed to
+    /// decrypt (a bot reply's `msmsg` included) or decrypted into something
+    /// unusable, a stanza none of whose `<enc>`s this client can decrypt (an
+    /// unsupported type or a malformed node), or an `<unavailable>` stub. At
+    /// most once per message within the client's
+    /// `undecryptable_dispatched` window. With an `InboundDurabilityHook`
+    /// registered it follows the hook's `on_undecryptable` returning `Ok`, and
+    /// a delivery the hook refused dispatches nothing.
     UndecryptableMessage(UndecryptableMessage),
     #[serde(skip)]
     Notification(Arc<OwnedNodeRef>),

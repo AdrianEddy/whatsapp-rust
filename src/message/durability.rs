@@ -78,10 +78,17 @@ impl Client {
                 }
                 // Only an explicitly retired terminal rejection can unblock
                 // another carrier. Errors with owned raw remain retryable.
-                Err(_) => !self
-                    .inbound_commit_batch
-                    .live_retention
-                    .has_raw_origin(entry.origin),
+                Err(_)
+                    if self
+                        .inbound_commit_batch
+                        .live_retention
+                        .has_raw_origin(entry.origin) =>
+                {
+                    false
+                }
+                // The delivery that decrypted it was cancelled before this
+                // check, so it was never reported: report it now.
+                Err(_) => self.report_replayed_plaintext_failure(info, &entry).await,
             };
             if !progressed {
                 return false;
@@ -136,9 +143,9 @@ impl Client {
     /// A completed hook publication suppresses cleanup replay within this
     /// Client's dispatch cache. Hooks and consumers still need idempotence
     /// across cache expiry or process restart. A plain ack is sent only for
-    /// a genuine duplicate (no buffered copy). A read failure fails closed
-    /// (no ack) so a transient storage error cannot drop a message that still
-    /// needs its hook to commit.
+    /// a genuine duplicate (no buffered copy, no undecryptable report still
+    /// owed). A read failure fails closed (no ack) so a transient storage
+    /// error cannot drop a message that still needs its hook to commit.
     ///
     /// Returns `true` when a buffered copy was replayed *and* its commit will
     /// dispatch it, which hands the message to consumers again: a caller
@@ -183,6 +190,17 @@ impl Client {
                     let decoded = raw_pending::PendingJournal::decode(bytes);
                     let storage_sender: Arc<str> = sender.into();
                     drop(read_lease);
+                    // The message still owes an undecryptable report, refused
+                    // on this delivery or a concurrent one. Its next delivery
+                    // makes it before decrypting (and replays what the row
+                    // holds); until then the stanza is no duplicate to ack.
+                    if decoded.as_ref().is_ok_and(|journal| journal.owed.is_some()) {
+                        log::debug!(
+                            "[msg:{}] an undecryptable report of this message is still owed; leaving the stanza for its redelivery",
+                            info.id
+                        );
+                        return false;
+                    }
                     let replay = match decoded.and_then(|journal| {
                         journal
                             .occurrences

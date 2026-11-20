@@ -1,9 +1,15 @@
 //! Carrier-preserving journal used by the existing inbound batch pipeline.
 
+use crate::types::durability_hook::{UndecryptableCause, UndecryptableRecovery};
 use bytes::Bytes;
-use wacore::types::events::InboundMessage;
+use wacore::types::events::{DecryptFailMode, EncDecryptFailureReason, InboundMessage};
 
 const MAGIC: &[u8; 6] = b"\0WRPD\x04";
+/// [`MAGIC`]'s layout for a journal that owes an undecryptable report
+/// ([`PendingJournal::owed`]): one byte after the generation holds it, and the
+/// journal may have no occurrence. A journal that owes nothing keeps
+/// [`MAGIC`], so its rows stay what older builds read.
+const OWED_MAGIC: &[u8; 6] = b"\0WRPD\x05";
 const GROUPED_MAGIC: &[u8; 6] = b"\0WRPD\x03";
 const LEGACY_MAGIC: &[u8; 6] = b"\0WRPD\x01";
 pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
@@ -111,9 +117,50 @@ pub(super) struct Occurrence {
     pub original: Bytes,
     pub projection: Bytes,
 }
+
+/// An undecryptable report of the message that the inbound durability hook
+/// refused, owed to the stanza's redelivery. Only a report whose `<enc>`
+/// decrypted is owed: its plaintext was unusable, and the redelivery decrypts
+/// as a duplicate (the ratchet moved on), so it can't report it by itself.
+/// Every other failure happens again on redelivery. The failure is therefore
+/// always [`EncDecryptFailureReason::PlaintextUnusable`] and only the sender's
+/// decrypt-fail mode is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OwedReport {
+    pub decrypt_fail_mode: DecryptFailMode,
+}
+impl OwedReport {
+    /// The report the redelivery makes: nothing asks for the message again,
+    /// and the redelivery is then answered as its own content says.
+    pub fn cause(self) -> UndecryptableCause {
+        UndecryptableCause::enc(
+            EncDecryptFailureReason::PlaintextUnusable,
+            UndecryptableRecovery::NoRequest,
+            self.decrypt_fail_mode,
+        )
+    }
+    fn byte(self) -> u8 {
+        match self.decrypt_fail_mode {
+            DecryptFailMode::Show => 0,
+            DecryptFailMode::Hide => 1,
+        }
+    }
+    fn from_byte(byte: u8) -> anyhow::Result<Self> {
+        let decrypt_fail_mode = match byte {
+            0 => DecryptFailMode::Show,
+            1 => DecryptFailMode::Hide,
+            _ => anyhow::bail!("invalid owed undecryptable report"),
+        };
+        Ok(Self { decrypt_fail_mode })
+    }
+}
+
 pub(super) struct PendingJournal {
     generation: [u8; 16],
     pub occurrences: Vec<Occurrence>,
+    /// The message's undecryptable report the hook refused, kept in the same
+    /// row as its decodable occurrences so every writer of the row keeps it.
+    pub owed: Option<OwedReport>,
     backing: Option<Bytes>,
 }
 impl Default for PendingJournal {
@@ -121,11 +168,25 @@ impl Default for PendingJournal {
         Self {
             generation: rand::random(),
             occurrences: Vec::new(),
+            owed: None,
             backing: None,
         }
     }
 }
 impl PendingJournal {
+    /// A fresh journal holding only `owed`.
+    pub fn owing(owed: OwedReport) -> Self {
+        Self {
+            owed: Some(owed),
+            ..Self::default()
+        }
+    }
+
+    /// The bytes before the occurrences.
+    fn header_len(&self) -> usize {
+        MAGIC.len() + 16 + usize::from(self.owed.is_some()) + 4
+    }
+
     pub fn decode(bytes: Bytes) -> anyhow::Result<Self> {
         anyhow::ensure!(
             bytes.len() <= MAX_PENDING_BYTES,
@@ -144,10 +205,12 @@ impl PendingJournal {
                     original: bytes,
                     projection: waproto::codec::message_to_vec(&message).into(),
                 }],
+                owed: None,
                 backing: None,
             });
         }
-        let compact = bytes.starts_with(MAGIC);
+        let owing = bytes.starts_with(OWED_MAGIC);
+        let compact = owing || bytes.starts_with(MAGIC);
         let grouped = compact || bytes.starts_with(GROUPED_MAGIC);
         anyhow::ensure!(
             grouped || bytes.starts_with(LEGACY_MAGIC),
@@ -158,9 +221,16 @@ impl PendingJournal {
             offset: MAGIC.len(),
         };
         let generation: [u8; 16] = cursor.take(16)?.as_ref().try_into()?;
+        let owed = if owing {
+            Some(OwedReport::from_byte(cursor.byte()?)?)
+        } else {
+            None
+        };
         let count = cursor.number()?;
+        // Only a journal that owes a report may hold no occurrence.
         anyhow::ensure!(
-            count != 0 && count <= cursor.remaining() / if grouped { 30 } else { 13 },
+            (count != 0 || owed.is_some())
+                && count <= cursor.remaining() / if grouped { 30 } else { 13 },
             "invalid pending occurrence count"
         );
         anyhow::ensure!(
@@ -204,6 +274,7 @@ impl PendingJournal {
         let journal = Self {
             generation,
             occurrences,
+            owed,
             backing: grouped.then(|| cursor.bytes.clone()),
         };
         journal.validate()?;
@@ -219,7 +290,10 @@ impl PendingJournal {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.occurrences.is_empty(), "empty pending journal");
+        anyhow::ensure!(
+            !self.occurrences.is_empty() || self.owed.is_some(),
+            "empty pending journal"
+        );
         for (position, entry) in self.occurrences.iter().enumerate() {
             if let Some(index) = entry.index {
                 anyhow::ensure!(
@@ -302,7 +376,7 @@ impl PendingJournal {
     fn retained_size(&self) -> Option<usize> {
         self.occurrences
             .iter()
-            .try_fold(MAGIC.len() + 16 + 4, |size, entry| {
+            .try_fold(self.header_len(), |size, entry| {
                 size.checked_add(30 + size_of::<Occurrence>())
                     .and_then(|size| size.checked_add(entry.original.len()))
                     .and_then(|size| size.checked_add(entry.projection.len()))
@@ -319,15 +393,22 @@ impl PendingJournal {
 
     #[inline(never)]
     fn matches_backing(&self, bytes: &Bytes) -> anyhow::Result<bool> {
+        // A report owed or settled since the decode changes the version too.
+        let owing = bytes.starts_with(OWED_MAGIC);
+        if owing != self.owed.is_some() {
+            return Ok(false);
+        }
         let mut cursor = Cursor {
             bytes: bytes.clone(),
             offset: MAGIC.len(),
         };
         if cursor.take(16)?.as_ref() != self.generation
+            || owing && Some(cursor.byte()?) != self.owed.map(OwedReport::byte)
             || cursor.number()? != self.occurrences.len()
         {
             return Ok(false);
         }
+        let compact = owing || bytes.starts_with(MAGIC);
         for entry in &self.occurrences {
             if cursor.take(1)?[0] != u8::from(entry.producer.is_some())
                 || cursor.take(16)?.as_ref() != entry.producer.map_or([0; 16], |id| id.0)
@@ -337,7 +418,7 @@ impl PendingJournal {
                 return Ok(false);
             }
             let original = cursor.blob()?;
-            let projection = cursor.projection(&original, bytes.starts_with(MAGIC))?;
+            let projection = cursor.projection(&original, compact)?;
             for (saved, current) in [
                 (&original, &entry.original),
                 (&projection, &entry.projection),
@@ -364,7 +445,7 @@ impl PendingJournal {
             return Ok(backing.clone());
         }
         // Do the complete wire-bound check before allocating the replacement.
-        let mut length = MAGIC.len() + 16 + 4;
+        let mut length = self.header_len();
         for occurrence in &self.occurrences {
             u32::try_from(occurrence.original.len())?;
             u32::try_from(occurrence.projection.len())?;
@@ -388,8 +469,17 @@ impl PendingJournal {
             .map(|entry| entry.projection.len())
             .sum();
         let mut out = Vec::with_capacity(length - saved);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&self.generation);
+        match self.owed {
+            Some(owed) => {
+                out.extend_from_slice(OWED_MAGIC);
+                out.extend_from_slice(&self.generation);
+                out.push(owed.byte());
+            }
+            None => {
+                out.extend_from_slice(MAGIC);
+                out.extend_from_slice(&self.generation);
+            }
+        }
         out.extend_from_slice(&u32::try_from(self.occurrences.len())?.to_le_bytes());
         for occurrence in &self.occurrences {
             out.push(u8::from(occurrence.producer.is_some()));
@@ -429,6 +519,12 @@ impl Cursor {
         let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(bytes)
+    }
+    fn byte(&mut self) -> anyhow::Result<u8> {
+        let end = self.end(1)?;
+        let byte = self.bytes[self.offset];
+        self.offset = end;
+        Ok(byte)
     }
     #[inline(never)]
     fn number(&mut self) -> anyhow::Result<usize> {
@@ -640,7 +736,7 @@ mod tests {
             assert!(PendingJournal::decode(bytes.slice(..end)).is_err());
         }
         let mut future = bytes.to_vec();
-        future[5] = 5;
+        future[5] = 6;
         assert!(PendingJournal::decode(future.into()).is_err());
         journal.occurrences[0].original = vec![0; MAX_PENDING_BYTES].into();
         assert!(journal.encode().is_err());
