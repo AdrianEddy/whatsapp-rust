@@ -219,15 +219,19 @@ async fn main() {
 
     // A directory of our own, created exclusively and owner-only: the create
     // fails outright if anything already sits at the path (a symlink included),
-    // and mode 0o700 keeps it that way regardless of umask. Between them,
-    // nobody else on the machine can pre-place or swap the database, WAL and
-    // shm files this then writes.
-    use std::os::unix::fs::DirBuilderExt as _;
+    // and on Unix mode 0o700 keeps it that way regardless of umask. Between
+    // them, nobody else on the machine can pre-place or swap the database, WAL
+    // and shm files this then writes. Elsewhere the directory takes the temp
+    // directory's own permissions (on Windows the per-user %TEMP%).
     let dir = std::env::temp_dir().join(format!("wa_percon_{}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .expect("exclusive scratch directory");
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::create_dir(&dir);
+    created.expect("exclusive scratch directory");
     // A guard, not a tail cleanup: two of the modes below return early.
     struct ScratchDir(std::path::PathBuf);
     impl Drop for ScratchDir {
