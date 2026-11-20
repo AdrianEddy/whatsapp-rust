@@ -1781,7 +1781,9 @@ async fn duplicate_owing_a_report_is_not_acked() {
 /// encoding, so its rows stay what older builds read; one that owes a report
 /// is V5 and keeps the report's decrypt-fail mode, also with no occurrence,
 /// through a decode, an unchanged re-encode (its backing reused), a merge (the
-/// batch's row write) and the settlement.
+/// batch's row write) and the settlement. The row holding the report alone,
+/// which the batch's cleanup writes without a fallible encode, has exactly
+/// the bytes `encode` writes for that journal.
 #[test]
 fn owed_report_journal_encoding() {
     let hide = OwedReport {
@@ -1809,10 +1811,15 @@ fn owed_report_journal_encoding() {
     assert_eq!(decoded.owed, Some(hide));
     assert_eq!(decoded.occurrences.len(), 1);
 
-    let alone = PendingJournal::owing(hide)
-        .encode()
-        .expect("an owed report alone encodes");
+    let alone = PendingJournal::owing_bytes(hide);
+    assert_eq!(
+        alone.len(),
+        6 + 16 + 1 + 4,
+        "version, generation, report, count"
+    );
     assert!(alone.starts_with(b"\0WRPD\x05"));
+    assert_eq!(alone[22], 1, "the report's decrypt-fail mode: hide");
+    assert_eq!(alone[23..], [0; 4], "no occurrence");
     let mut decoded = PendingJournal::decode(alone.clone()).expect("it decodes");
     assert_eq!(decoded.owed, Some(hide));
     assert!(decoded.occurrences.is_empty());
@@ -1820,6 +1827,21 @@ fn owed_report_journal_encoding() {
         decoded.encode().expect("re-encodes").as_ptr(),
         alone.as_ptr(),
         "unchanged, its backing is reused"
+    );
+    // A mode changed and changed back makes `encode` write the row afresh
+    // under the same generation: the very bytes `owing_bytes` wrote.
+    let mut show = PendingJournal::decode(alone.clone()).expect("decodes");
+    show.owed = Some(OwedReport {
+        decrypt_fail_mode: DecryptFailMode::Show,
+    });
+    let show = show.encode().expect("an owed report alone encodes");
+    assert_ne!(show, alone, "the mode's byte is rewritten");
+    let mut back = PendingJournal::decode(show).expect("decodes");
+    back.owed = Some(hide);
+    assert_eq!(
+        back.encode().expect("an owed report alone encodes"),
+        alone,
+        "`owing_bytes` writes what `encode` writes"
     );
     decoded
         .merge(occurrence(b"sibling"))

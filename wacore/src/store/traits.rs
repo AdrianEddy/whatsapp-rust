@@ -1260,11 +1260,77 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
-    /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
-    /// offline drain buffers one commit-batch of messages per call, so backends
-    /// should override this with a single transaction (the bundled SqliteStore
-    /// does). The default iterates the single-row method, preserving behavior
-    /// for third-party backends.
+    /// Conditional replacement of several rows, each compared and written as
+    /// [`replace_pending_inbound_if`](Self::replace_pending_inbound_if) does
+    /// alone, under the same ownership rules. `Ok` holds one result per row, in
+    /// order: a row whose stored revision is not its expected one is left
+    /// untouched and reported `Conflict`, and the other rows are still
+    /// applied. `Err` leaves every row's outcome unknown (some may have been
+    /// applied); a caller that needs it reads the rows back.
+    ///
+    /// The inbound commit batcher writes a whole commit batch's journal rows
+    /// (an offline-drain batch holds up to 400 messages) with one call, so a
+    /// backend should override this with one transaction: one durable commit
+    /// per batch instead of one per message (the bundled SqliteStore does).
+    /// The default calls the single-row method for each row in order, also
+    /// past a row's conflict or error, and returns the first error after the
+    /// last row, so a backend that implements only the single-row methods
+    /// meets the per-row contract above, with one durable commit per row.
+    async fn replace_pending_inbound_batch_if(
+        &self,
+        rows: Vec<PendingInboundCas<'_>>,
+        max_bytes: usize,
+    ) -> Result<Vec<PendingInboundMutation>> {
+        let mut mutations = Vec::with_capacity(rows.len());
+        let mut failure = None;
+        for row in rows {
+            match self
+                .replace_pending_inbound_if(row.key, row.expected, row.replacement, max_bytes)
+                .await
+            {
+                Ok(mutation) => mutations.push(mutation),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(mutations), Err)
+    }
+
+    /// Conditional deletion of several rows, each compared and deleted as
+    /// [`delete_pending_inbound_if`](Self::delete_pending_inbound_if) does
+    /// alone with its expected revision, under the one `lease`. Results,
+    /// errors, the override guidance and the default's loop are those of
+    /// [`replace_pending_inbound_batch_if`](Self::replace_pending_inbound_batch_if):
+    /// the batcher removes a committed batch's rows with one call.
+    async fn delete_pending_inbound_batch_if(
+        &self,
+        rows: &[(PendingInboundKey<'_>, PendingInboundRevision)],
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Vec<PendingInboundMutation>> {
+        let mut mutations = Vec::with_capacity(rows.len());
+        let mut failure = None;
+        for &(key, expected) in rows {
+            match self
+                .delete_pending_inbound_if(key, expected, max_bytes, lease.clone())
+                .await
+            {
+                Ok(mutation) => mutations.push(mutation),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(mutations), Err)
+    }
+
+    /// Batched [`store_pending_inbound`](Self::store_pending_inbound), an
+    /// unconditional write of several rows. The client itself never calls it:
+    /// the commit batcher writes through
+    /// [`replace_pending_inbound_batch_if`](Self::replace_pending_inbound_batch_if).
+    /// A backend may override it with a single transaction (the bundled
+    /// SqliteStore does); the default iterates the single-row method.
     async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
         for row in rows {
             self.store_pending_inbound(row.chat, row.sender, row.id, row.message)
@@ -1273,8 +1339,10 @@ pub trait ProtocolStore: Send + Sync {
         Ok(())
     }
 
-    /// Batched [`delete_pending_inbound`](Self::delete_pending_inbound); same
-    /// override guidance as [`store_pending_inbound_batch`](Self::store_pending_inbound_batch).
+    /// Batched [`delete_pending_inbound`](Self::delete_pending_inbound), an
+    /// unconditional delete the client never calls (the batcher removes rows
+    /// with [`delete_pending_inbound_batch_if`](Self::delete_pending_inbound_batch_if));
+    /// same override guidance as [`store_pending_inbound_batch`](Self::store_pending_inbound_batch).
     async fn delete_pending_inbound_batch(&self, keys: &[PendingInboundKey<'_>]) -> Result<()> {
         for key in keys {
             self.delete_pending_inbound(key.chat, key.sender, key.id)
@@ -1300,6 +1368,17 @@ pub struct PendingInboundKey<'a> {
     pub chat: &'a str,
     pub sender: &'a str,
     pub id: &'a str,
+}
+
+/// One row of a conditional batch replacement
+/// ([`ProtocolStore::replace_pending_inbound_batch_if`]): the row, the
+/// revision its owner observed there ([`PendingInboundRevision::missing`] for
+/// an absent row) and the bytes to install, which carry their lease.
+#[derive(Debug)]
+pub struct PendingInboundCas<'a> {
+    pub key: PendingInboundKey<'a>,
+    pub expected: PendingInboundRevision,
+    pub replacement: PendingInboundPayload,
 }
 
 /// Revision of the exact stored bytes, including legacy encodings. New raw

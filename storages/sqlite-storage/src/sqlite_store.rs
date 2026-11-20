@@ -535,28 +535,44 @@ type BlockingJob<T> = Box<dyn FnOnce() -> Result<T> + Send>;
 
 type WriteJob<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
 
-// Native retries cross blocking worker boundaries; the browser shim runs inline.
-#[derive(Clone)]
 enum OwnedPendingMutation {
-    Replace {
-        payload: Arc<PendingInboundPayload>,
-        revision: PendingInboundRevision,
-    },
+    Replace(PendingInboundPayload),
     Delete(PendingInboundLease),
 }
 
 impl OwnedPendingMutation {
-    fn operation(&self) -> &'static str {
-        match self {
-            Self::Replace { .. } => "replace_pending_inbound_if",
-            Self::Delete(_) => "delete_pending_inbound_if",
-        }
-    }
-
     fn lease(&self) -> PendingInboundLease {
         match self {
-            Self::Replace { payload, .. } => payload.lease(),
+            Self::Replace(payload) => payload.lease(),
             Self::Delete(lease) => lease.clone(),
+        }
+    }
+}
+
+// One row of a conditional pending-inbound write. Native retries cross blocking
+// worker boundaries (the browser shim runs inline), so the rows, payloads and
+// leases are owned by the worker and each retry of it, also after the awaiting
+// caller is cancelled.
+struct OwnedPendingRow {
+    chat: String,
+    sender: String,
+    id: String,
+    expected: PendingInboundRevision,
+    mutation: OwnedPendingMutation,
+}
+
+impl OwnedPendingRow {
+    fn new(
+        key: PendingInboundKey<'_>,
+        expected: PendingInboundRevision,
+        mutation: OwnedPendingMutation,
+    ) -> Self {
+        Self {
+            chat: key.chat.to_owned(),
+            sender: key.sender.to_owned(),
+            id: key.id.to_owned(),
+            expected,
+            mutation,
         }
     }
 }
@@ -1598,78 +1614,60 @@ impl SqliteStore {
         Ok(result)
     }
 
-    // Share the mutation retry/transaction body while retaining owned leases
-    // in the worker, including when its awaiting caller is cancelled.
+    // Every conditional pending-inbound mutation, a single row or a batch:
+    // one immediate transaction, retried whole on contention, one result per
+    // row. As when the rows are mutated one by one, a conflicting row is left
+    // untouched without stopping the others, and a row that can't be compared
+    // (an oversized replacement, an oversized or non-BLOB stored payload)
+    // fails the call once the other rows are applied.
     async fn mutate_pending_inbound_owned(
         &self,
-        key: PendingInboundKey<'_>,
-        expected: PendingInboundRevision,
+        operation: &'static str,
+        rows: Arc<[OwnedPendingRow]>,
         max_bytes: usize,
-        mutation: OwnedPendingMutation,
-    ) -> Result<PendingInboundMutation> {
-        let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
+    ) -> Result<Vec<PendingInboundMutation>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         let device_id = self.device_id;
         let timestamp = self.insertion_time();
-        self.with_retry(mutation.operation(), || {
-            let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
-            let mutation = mutation.clone();
+        self.with_retry(operation, || {
+            let rows = Arc::clone(&rows);
             let timestamp = timestamp.clone();
             Box::new(move |conn| {
                 conn.immediate_transaction(|conn| {
-                    let current = match read_pending_inbound_bounded_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        max_bytes,
-                        mutation.lease(),
-                    )? {
-                        Ok(current) => current,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    let revision = current.as_ref().map_or(
-                        PendingInboundRevision::missing(),
-                        PendingInboundRecord::revision,
-                    );
-                    // Already-replaced is Applied even if the caller's expected
-                    // revision is stale. Delete has no such shortcut.
-                    if let OwnedPendingMutation::Replace {
-                        revision: replacement,
-                        ..
-                    } = &mutation
-                        && revision == *replacement
-                    {
-                        return Ok(Ok(PendingInboundMutation::Applied));
-                    }
-                    if revision != expected {
-                        return Ok(Ok(PendingInboundMutation::Conflict));
-                    }
-                    match &mutation {
-                        OwnedPendingMutation::Replace { payload, .. } => {
-                            insert_pending_inbound_row(
-                                conn,
-                                device_id,
-                                &chat,
-                                &sender,
-                                &id,
-                                payload.bytes(),
-                                &timestamp,
-                            )?;
-                        }
-                        OwnedPendingMutation::Delete(_) => {
-                            delete_pending_inbound_row(conn, device_id, &chat, &sender, &id)?;
+                    let mut mutations = Vec::with_capacity(rows.len());
+                    let mut failure = None;
+                    for row in rows.iter() {
+                        match mutate_pending_inbound_row(
+                            conn, device_id, row, max_bytes, &timestamp,
+                        )? {
+                            Ok(mutation) => mutations.push(mutation),
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                            }
                         }
                     }
-                    Ok(Ok(PendingInboundMutation::Applied))
+                    Ok(failure.map_or(Ok(mutations), Err))
                 })
             })
         })
         .await?
+    }
+
+    async fn mutate_one_pending_inbound(
+        &self,
+        operation: &'static str,
+        key: PendingInboundKey<'_>,
+        expected: PendingInboundRevision,
+        mutation: OwnedPendingMutation,
+        max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        let rows = Arc::new([OwnedPendingRow::new(key, expected, mutation)]);
+        // One row in, one result out.
+        Ok(self
+            .mutate_pending_inbound_owned(operation, rows, max_bytes)
+            .await?[0])
     }
 
     /// Execute a database operation with semaphore serialization and retry on
@@ -3706,6 +3704,77 @@ fn read_pending_inbound_bounded_row(
     })
 }
 
+/// A replacement over the caller's bound can't be compared. Of a row's checks,
+/// only this one needs no database state.
+fn check_replacement_len(payload: &PendingInboundPayload, max_bytes: usize) -> Result<()> {
+    let len = payload.bytes().len();
+    if len > max_bytes {
+        return Err(StoreError::Validation(format!(
+            "pending inbound replacement length {len} exceeds limit {max_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+/// One row's compare-and-set inside the caller's transaction: the inner error
+/// is the row's own (it can't be compared), the outer one the connection's.
+fn mutate_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    row: &OwnedPendingRow,
+    max_bytes: usize,
+    timestamp: &InsertionTime,
+) -> QueryResult<Result<PendingInboundMutation>> {
+    if let OwnedPendingMutation::Replace(payload) = &row.mutation
+        && let Err(error) = check_replacement_len(payload, max_bytes)
+    {
+        return Ok(Err(error));
+    }
+    let current = match read_pending_inbound_bounded_row(
+        conn,
+        device_id,
+        &row.chat,
+        &row.sender,
+        &row.id,
+        max_bytes,
+        row.mutation.lease(),
+    )? {
+        Ok(current) => current,
+        Err(error) => return Ok(Err(error)),
+    };
+    let revision = current.as_ref().map_or(
+        PendingInboundRevision::missing(),
+        PendingInboundRecord::revision,
+    );
+    // Already-replaced is Applied even if the caller's expected revision is
+    // stale. Delete has no such shortcut.
+    if let OwnedPendingMutation::Replace(payload) = &row.mutation
+        && revision == payload.revision()
+    {
+        return Ok(Ok(PendingInboundMutation::Applied));
+    }
+    if revision != row.expected {
+        return Ok(Ok(PendingInboundMutation::Conflict));
+    }
+    match &row.mutation {
+        OwnedPendingMutation::Replace(payload) => {
+            insert_pending_inbound_row(
+                conn,
+                device_id,
+                &row.chat,
+                &row.sender,
+                &row.id,
+                payload.bytes(),
+                timestamp,
+            )?;
+        }
+        OwnedPendingMutation::Delete(_) => {
+            delete_pending_inbound_row(conn, device_id, &row.chat, &row.sender, &row.id)?;
+        }
+    }
+    Ok(Ok(PendingInboundMutation::Applied))
+}
+
 /// Batch/single-row shared delete; see [`insert_pending_inbound_row`].
 fn delete_pending_inbound_row(
     conn: &mut SqliteConnection,
@@ -4887,21 +4956,16 @@ impl ProtocolStore for SqliteStore {
         replacement: PendingInboundPayload,
         max_bytes: usize,
     ) -> Result<PendingInboundMutation> {
-        if replacement.bytes().len() > max_bytes {
-            return Err(StoreError::Validation(format!(
-                "pending inbound replacement length {} exceeds limit {max_bytes}",
-                replacement.bytes().len(),
-            )));
-        }
-        let revision = replacement.revision();
-        self.mutate_pending_inbound_owned(
+        // Refused before the write queue, so a call that writes nothing takes
+        // no write lock and awaits no commit barrier. A batch's row is checked
+        // in its transaction instead, as that row's own error.
+        check_replacement_len(&replacement, max_bytes)?;
+        self.mutate_one_pending_inbound(
+            "replace_pending_inbound_if",
             key,
             expected,
+            OwnedPendingMutation::Replace(replacement),
             max_bytes,
-            OwnedPendingMutation::Replace {
-                payload: Arc::new(replacement),
-                revision,
-            },
         )
         .await
     }
@@ -4913,13 +4977,51 @@ impl ProtocolStore for SqliteStore {
         max_bytes: usize,
         lease: PendingInboundLease,
     ) -> Result<PendingInboundMutation> {
-        self.mutate_pending_inbound_owned(
+        self.mutate_one_pending_inbound(
+            "delete_pending_inbound_if",
             key,
             expected,
-            max_bytes,
             OwnedPendingMutation::Delete(lease),
+            max_bytes,
         )
         .await
+    }
+
+    // The commit batcher's journal write and cleanup: one transaction (one WAL
+    // commit) per batch.
+    async fn replace_pending_inbound_batch_if(
+        &self,
+        rows: Vec<PendingInboundCas<'_>>,
+        max_bytes: usize,
+    ) -> Result<Vec<PendingInboundMutation>> {
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                OwnedPendingRow::new(
+                    row.key,
+                    row.expected,
+                    OwnedPendingMutation::Replace(row.replacement),
+                )
+            })
+            .collect();
+        self.mutate_pending_inbound_owned("replace_pending_inbound_batch_if", rows, max_bytes)
+            .await
+    }
+
+    async fn delete_pending_inbound_batch_if(
+        &self,
+        rows: &[(PendingInboundKey<'_>, PendingInboundRevision)],
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Vec<PendingInboundMutation>> {
+        let rows = rows
+            .iter()
+            .map(|&(key, expected)| {
+                OwnedPendingRow::new(key, expected, OwnedPendingMutation::Delete(lease.clone()))
+            })
+            .collect();
+        self.mutate_pending_inbound_owned("delete_pending_inbound_batch_if", rows, max_bytes)
+            .await
     }
 
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -5461,6 +5563,9 @@ mod retry_tests {
         assert!(started.elapsed() >= Duration::from_millis(4));
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

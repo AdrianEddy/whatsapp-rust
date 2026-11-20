@@ -16,8 +16,8 @@ use crate::flush_scope::DrainOutcome;
 use portable_atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use wacore::store::traits::{
-    PendingInboundKey, PendingInboundLease, PendingInboundMutation, PendingInboundPayload,
-    PendingInboundRevision,
+    PendingInboundCas, PendingInboundKey, PendingInboundLease, PendingInboundMutation,
+    PendingInboundPayload, PendingInboundRevision,
 };
 use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
 
@@ -498,6 +498,38 @@ struct StoredPendingGroup {
     owed: Option<OwedReport>,
 }
 
+impl StoredPendingGroup {
+    fn key(&self) -> PendingInboundKey<'_> {
+        PendingInboundKey {
+            chat: &self.chat,
+            sender: &self.sender,
+            id: &self.id,
+        }
+    }
+}
+
+/// Each row's outcome from one batched conditional call, in row order:
+/// `None` for every row when the call failed (or answered for another number
+/// of rows), whose outcome is then unknown; the call's error goes with them.
+fn row_outcomes(
+    result: wacore::store::error::Result<Vec<PendingInboundMutation>>,
+    rows: usize,
+) -> (Vec<Option<PendingInboundMutation>>, Option<anyhow::Error>) {
+    match result {
+        Ok(mutations) if mutations.len() == rows => {
+            (mutations.into_iter().map(Some).collect(), None)
+        }
+        Ok(mutations) => (
+            vec![None; rows],
+            Some(anyhow::anyhow!(
+                "pending cleanup answered {} rows of {rows}",
+                mutations.len()
+            )),
+        ),
+        Err(error) => (vec![None; rows], Some(error.into())),
+    }
+}
+
 fn has_physical_aliases(rows: &[StoredPendingGroup]) -> bool {
     rows.iter().any(|row| {
         rows.iter()
@@ -796,7 +828,16 @@ impl Client {
         } else {
             PendingInboundLease::new(Arc::new((lease, alias_charges)))
         };
-        let mut stored = Vec::with_capacity(groups.len());
+        // Every row is read and its replacement encoded first; then one
+        // conditional write carries the whole batch, a single transaction in a
+        // backend that overrides it, instead of one per message. Each row's
+        // write rides in one vector with it until the reads are done: a second
+        // vector live across every read would grow each future that awaits a
+        // commit inline (the keepalive's reconnect teardown, the chat lanes).
+        // So every encoded journal stays resident until that write returns
+        // (the batch's deliveries again, plus any prior content of each row);
+        // the lease's live charges price the retained copies, not these.
+        let mut entries = Vec::with_capacity(groups.len());
         for (chat, mut sender, id, deliveries, lookup) in groups {
             let key = PendingInboundKey {
                 chat: &chat,
@@ -819,11 +860,6 @@ impl Client {
                     .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
                     .await?
             };
-            let key = PendingInboundKey {
-                chat: &chat,
-                sender: &sender,
-                id: &id,
-            };
             let expected = record
                 .as_ref()
                 .map_or(PendingInboundRevision::missing(), |record| {
@@ -836,27 +872,61 @@ impl Client {
                 }
                 None => PendingJournal::default(),
             };
+            // The report the row owes rides along: the replacement re-encodes
+            // the decoded journal, and cleanup keeps it.
             let owed = journal.owed;
             let (encoded, complete) =
                 self.encode_pending_deliveries(journal, deliveries, is_drain, &owner)?;
-            let payload = PendingInboundPayload::new(encoded, lease.clone());
-            let revision = payload.revision();
-            anyhow::ensure!(
-                backend
-                    .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)
-                    .await?
-                    == PendingInboundMutation::Applied,
-                "pending occurrence revision conflict"
-            );
-            stored.push(StoredPendingGroup {
+            let replacement = PendingInboundPayload::new(encoded, lease.clone());
+            let row = StoredPendingGroup {
                 chat,
                 sender,
                 id,
-                revision,
+                revision: replacement.revision(),
                 complete,
                 owed,
-            });
+            };
+            entries.push((row, (expected, replacement)));
         }
+        let (stored, writes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        // Every row was read before any write, so two rows of one physical key
+        // would carry the same `expected`, and the second would conflict on
+        // every retry of the batch. The grouping above keeps the keys distinct:
+        // equal sender spellings share a group, and a lookup group is the only
+        // group of its sender, so the key its lookup resolves is no other's.
+        debug_assert!(
+            stored.iter().enumerate().all(|(index, row)| {
+                let key = (&row.chat, &row.sender, &row.id);
+                stored[..index]
+                    .iter()
+                    .all(|earlier| (&earlier.chat, &earlier.sender, &earlier.id) != key)
+            }),
+            "pending batch repeats a physical key"
+        );
+        let rows = stored
+            .iter()
+            .zip(writes)
+            .map(|(row, (expected, replacement))| PendingInboundCas {
+                key: row.key(),
+                expected,
+                replacement,
+            })
+            .collect();
+        let mutations = backend
+            .replace_pending_inbound_batch_if(rows, MAX_PENDING_BYTES)
+            .await?;
+        anyhow::ensure!(
+            mutations.len() == stored.len(),
+            "pending occurrence write answered {} rows of {}",
+            mutations.len(),
+            stored.len()
+        );
+        anyhow::ensure!(
+            mutations
+                .iter()
+                .all(|mutation| *mutation == PendingInboundMutation::Applied),
+            "pending occurrence revision conflict"
+        );
         Ok(stored)
     }
 
@@ -933,75 +1003,101 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("pending cleanup worker stopped"))?
     }
 
+    /// Remove what a batch committed from its rows: one conditional delete for
+    /// the batch, each row against the revision the batch wrote. A row that
+    /// also owes an undecryptable report keeps it, alone, for the stanza's
+    /// redelivery: those rows are replaced in a second call, made only when
+    /// one owes. A row another writer changed meanwhile stays as it is. A
+    /// failed row withholds the ACK, but the other rows are still cleaned:
+    /// leaving both physical aliases would make bounded replay ambiguous. A
+    /// call that fails as a whole may have cleaned none of its rows, aliases
+    /// included (a backend's one transaction rolled back): each is read back,
+    /// and a row left as it was withholds the ACK.
     async fn cleanup_pending_group_owned(&self, rows: &[StoredPendingGroup]) -> anyhow::Result<()> {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
-        let lease = PendingInboundLease::new(owner.clone());
+        let lease = PendingInboundLease::new(owner);
         let backend = self.persistence_manager.backend();
-        let mut failure = None;
+        let mut deletes = Vec::with_capacity(rows.len());
+        let mut replacements = Vec::new();
+        // What each row holds once cleaned: nothing, or the owed report.
+        let mut remaining = Vec::with_capacity(rows.len());
         for row in rows {
-            let key = PendingInboundKey {
-                chat: &row.chat,
-                sender: &row.sender,
-                id: &row.id,
-            };
-            let result = Self::clean_committed_row(&*backend, key, row, &lease).await;
-            if let Err(error) = result {
-                // Retain ACK failure, but clean other owned revisions: leaving
-                // both physical aliases would make bounded replay ambiguous.
-                failure.get_or_insert(error);
+            match row.owed {
+                None => {
+                    deletes.push((row.key(), row.revision));
+                    remaining.push(None);
+                }
+                Some(owed) => {
+                    let replacement = PendingInboundPayload::new(
+                        PendingJournal::owing_bytes(owed),
+                        lease.clone(),
+                    );
+                    remaining.push(Some(replacement.revision()));
+                    replacements.push(PendingInboundCas {
+                        key: row.key(),
+                        expected: row.revision,
+                        replacement,
+                    });
+                }
             }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    /// Remove what a batch committed from its row. An undecryptable report
-    /// the row also owes stays, alone in the row, for the stanza's redelivery.
-    async fn clean_committed_row(
-        backend: &dyn crate::store::traits::Backend,
-        key: PendingInboundKey<'_>,
-        row: &StoredPendingGroup,
-        lease: &PendingInboundLease,
-    ) -> anyhow::Result<()> {
-        let (mutation, remaining) = match row.owed {
-            None => (
+        let (deleted, mut delete_error) = if deletes.is_empty() {
+            (Vec::new(), None)
+        } else {
+            row_outcomes(
                 backend
-                    .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
+                    .delete_pending_inbound_batch_if(&deletes, MAX_PENDING_BYTES, lease.clone())
                     .await,
-                None,
-            ),
-            Some(owed) => {
-                let payload = PendingInboundPayload::new(
-                    PendingJournal::owing(owed).encode()?,
-                    lease.clone(),
-                );
-                let remaining = Some(payload.revision());
-                (
-                    backend
-                        .replace_pending_inbound_if(key, row.revision, payload, MAX_PENDING_BYTES)
-                        .await,
-                    remaining,
-                )
-            }
+                deletes.len(),
+            )
         };
-        match mutation {
-            Ok(PendingInboundMutation::Applied) => Ok(()),
-            Ok(_) => Err(anyhow::anyhow!(
-                "pending occurrence cleanup revision conflict"
-            )),
-            // An error can follow an applied mutation. Verify what it left
-            // under the same owner, and never touch a successor.
-            Err(error) => match backend
-                .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
-                .await
-            {
-                Ok(found) if found.as_ref().map(|record| record.revision()) == remaining => Ok(()),
-                Ok(_) => Err(error.into()),
-                Err(error) => Err(error.into()),
-            },
+        let replaced_rows = replacements.len();
+        let (replaced, mut replace_error) = if replacements.is_empty() {
+            (Vec::new(), None)
+        } else {
+            row_outcomes(
+                backend
+                    .replace_pending_inbound_batch_if(replacements, MAX_PENDING_BYTES)
+                    .await,
+                replaced_rows,
+            )
+        };
+        let (mut deleted, mut replaced) = (deleted.into_iter(), replaced.into_iter());
+        let mut failure = None;
+        for (row, remaining) in rows.iter().zip(remaining) {
+            let (outcome, call_error) = if row.owed.is_some() {
+                (replaced.next().flatten(), &mut replace_error)
+            } else {
+                (deleted.next().flatten(), &mut delete_error)
+            };
+            match outcome {
+                Some(PendingInboundMutation::Applied) => {}
+                Some(_) => {
+                    failure.get_or_insert_with(|| {
+                        anyhow::anyhow!("pending occurrence cleanup revision conflict")
+                    });
+                }
+                // An error can follow an applied mutation. Verify what it left
+                // under the same owner, and never touch a successor.
+                None => match backend
+                    .read_pending_inbound_bounded(row.key(), MAX_PENDING_BYTES, lease.clone())
+                    .await
+                {
+                    Ok(found) if found.as_ref().map(|record| record.revision()) == remaining => {}
+                    Ok(_) => {
+                        failure.get_or_insert_with(|| {
+                            call_error.take().unwrap_or_else(|| {
+                                anyhow::anyhow!("pending occurrence cleanup left a row unverified")
+                            })
+                        });
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error.into());
+                    }
+                },
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -2227,6 +2323,9 @@ impl Client {
         }
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

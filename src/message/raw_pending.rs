@@ -174,17 +174,40 @@ impl Default for PendingJournal {
     }
 }
 impl PendingJournal {
-    /// A fresh journal holding only `owed`.
-    pub fn owing(owed: OwedReport) -> Self {
-        Self {
+    /// The bytes of a fresh journal holding only `owed`, with no occurrence:
+    /// what [`Self::encode`] writes for it. Such a journal is always valid and
+    /// far within the bound, so unlike `encode` this can't fail.
+    pub fn owing_bytes(owed: OwedReport) -> Bytes {
+        let journal = Self {
             owed: Some(owed),
             ..Self::default()
-        }
+        };
+        let mut out = Vec::with_capacity(journal.header_len());
+        journal.write_header(&mut out, 0);
+        out.into()
     }
 
     /// The bytes before the occurrences.
     fn header_len(&self) -> usize {
         MAGIC.len() + 16 + usize::from(self.owed.is_some()) + 4
+    }
+
+    /// Write the [`Self::header_len`] bytes before the occurrences: the
+    /// version, the generation, the owed report's byte when one is owed, and
+    /// the number of occurrences that follow.
+    fn write_header(&self, out: &mut Vec<u8>, count: u32) {
+        match self.owed {
+            Some(owed) => {
+                out.extend_from_slice(OWED_MAGIC);
+                out.extend_from_slice(&self.generation);
+                out.push(owed.byte());
+            }
+            None => {
+                out.extend_from_slice(MAGIC);
+                out.extend_from_slice(&self.generation);
+            }
+        }
+        out.extend_from_slice(&count.to_le_bytes());
     }
 
     pub fn decode(bytes: Bytes) -> anyhow::Result<Self> {
@@ -469,18 +492,7 @@ impl PendingJournal {
             .map(|entry| entry.projection.len())
             .sum();
         let mut out = Vec::with_capacity(length - saved);
-        match self.owed {
-            Some(owed) => {
-                out.extend_from_slice(OWED_MAGIC);
-                out.extend_from_slice(&self.generation);
-                out.push(owed.byte());
-            }
-            None => {
-                out.extend_from_slice(MAGIC);
-                out.extend_from_slice(&self.generation);
-            }
-        }
-        out.extend_from_slice(&u32::try_from(self.occurrences.len())?.to_le_bytes());
+        self.write_header(&mut out, u32::try_from(self.occurrences.len())?);
         for occurrence in &self.occurrences {
             out.push(u8::from(occurrence.producer.is_some()));
             out.extend_from_slice(&occurrence.producer.map_or([0; 16], |id| id.0));

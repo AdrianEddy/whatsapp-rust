@@ -36,6 +36,8 @@ pub(crate) struct ProbeBackend {
     gate_taken: AtomicBool,
     fail_save: bool,
     pub(crate) fail_maintenance: bool,
+    /// When set, the name of every forwarded call, in call order.
+    pub(crate) calls: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl ProbeBackend {
@@ -60,12 +62,18 @@ impl ProbeBackend {
                 gate_taken: AtomicBool::new(false),
                 fail_save: false,
                 fail_maintenance: false,
+                calls: None,
             },
             dropped,
         )
     }
 
     pub(crate) async fn before_call(&self, method: &str) {
+        if let Some(calls) = &self.calls
+            && !method.starts_with("after:")
+        {
+            calls.lock().unwrap().push(method.to_owned());
+        }
         if method != self.gate_method {
             return;
         }

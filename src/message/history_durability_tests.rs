@@ -553,7 +553,7 @@ async fn durable_history_skip_acknowledges_without_capture() {
 async fn durable_history_journal_failure_retains_retry_without_calling_host() {
     let (mut backend, _) = crate::store::release::tests::ProbeBackend::new();
     let failing = Arc::new(AtomicBool::new(false));
-    backend.fail_before_method = Some(("replace_pending_inbound_if", failing.clone()));
+    backend.fail_before_method = Some(("replace_pending_inbound_batch_if", failing.clone()));
     let (client, hook, transport) = client(Arc::new(backend)).await;
     let info = info("JOURNAL_FAILURE");
     failing.store(true, Ordering::SeqCst);

@@ -114,6 +114,8 @@ impl ProtocolStore for PendingBackend {
         fn read_pending_inbound_group_bounded<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, max_bytes: usize, lease: PendingInboundLease) -> Result<Option<(String, PendingInboundRecord)>>;
         fn replace_pending_inbound_if<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, expected: PendingInboundRevision, replacement: PendingInboundPayload, max_bytes: usize) -> Result<PendingInboundMutation>;
         fn delete_pending_inbound_if<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, expected: PendingInboundRevision, max_bytes: usize, lease: PendingInboundLease) -> Result<PendingInboundMutation>;
+        fn replace_pending_inbound_batch_if<'s, 'a>(this: &'s Self, rows: Vec<PendingInboundCas<'a>>, max_bytes: usize) -> Result<Vec<PendingInboundMutation>>;
+        fn delete_pending_inbound_batch_if<'s, 'a, 'b>(this: &'s Self, rows: &'a [(PendingInboundKey<'b>, PendingInboundRevision)], max_bytes: usize, lease: PendingInboundLease) -> Result<Vec<PendingInboundMutation>>;
         fn store_pending_inbound_batch<'s, 'a, 'b>(this: &'s Self, rows: &'a [PendingInboundRow<'b>]) -> Result<()>;
         fn delete_pending_inbound_batch<'s, 'a, 'b>(this: &'s Self, keys: &'a [PendingInboundKey<'b>]) -> Result<()>;
     }
