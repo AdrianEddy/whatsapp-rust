@@ -501,6 +501,7 @@ pub use client::{
     SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use client::{NodeFilter, NodeWaiter};
+pub use types::app_state_durability::{AppStateBatch, AppStateBatchKind, AppStateDurabilityHook};
 pub use types::connect_admission::ConnectAdmission;
 pub use types::decrypt_failure_admission::{
     DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,

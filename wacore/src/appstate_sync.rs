@@ -1,5 +1,8 @@
 pub mod preparation;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mc_tests;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -103,7 +106,8 @@ fn committed_mutations_error(
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-/// Persists mutation-derived state that must not lag its app-state cursor.
+/// Persists the mutations, and the state derived from them, that must not lag
+/// their app-state cursor.
 ///
 /// The processor calls this hook before committing the cursor for a patch,
 /// snapshot, or snapshot recovery. A hook error leaves that cursor unchanged
@@ -123,7 +127,115 @@ pub trait AppStateMutationPersistence: crate::sync_marker::MaybeSendSync {
     ) -> crate::store::error::Result<()> {
         Ok(())
     }
+
+    /// Persist one batch of mutations before the cursor that covers it moves.
+    ///
+    /// Called once for each patch that carries a mutation and for every
+    /// snapshot and snapshot recovery, an empty one included (it says the
+    /// collection is empty), after the two effects above and before the
+    /// processor commits any of the batch's rows: before `commit_patch` for a
+    /// patch, before the MAC rewrite and `set_version` for a snapshot or a
+    /// recovery. (A collection starting over without a baseline has already
+    /// had the stale MAC rows of a reset cleared before its genesis patch.)
+    /// [`AppStateBatch`] says what the batch is, the version it brings the
+    /// collection to and the provenance its events carry.
+    ///
+    /// An error leaves the collection's rows as this call found them, so the
+    /// same mutations are offered again by a later sync, and a crash between
+    /// this call and the commit offers them again too: implementations must be
+    /// idempotent. So does a caller that retires while this runs (see
+    /// [`StillCurrentFn`]): the processor then writes none of the batch's rows,
+    /// and the collection's next sync offers it again. The error is returned
+    /// to the caller as it is. The default persists nothing.
+    async fn persist_mutations(&self, _batch: AppStateBatch<'_>) -> Result<()> {
+        Ok(())
+    }
 }
+
+/// One commit's worth of app-state mutations, as
+/// [`AppStateMutationPersistence::persist_mutations`] receives it: a patch, a
+/// snapshot or a recovery of one collection.
+#[derive(Clone, Copy, Debug)]
+pub struct AppStateBatch<'a> {
+    /// The collection's wire name (`regular`, `regular_low`, `regular_high`,
+    /// `critical_block`, `critical_unblock_low`).
+    pub collection: &'a str,
+    /// Whether the batch changes the collection or is the whole of it.
+    pub kind: AppStateBatchKind,
+    /// The collection's version once this batch is committed: the patch's
+    /// own, the snapshot's or the recovery's. A consumer that replaces a
+    /// collection from a whole-collection batch drops only what it last wrote
+    /// at or below this version, so a batch that arrives after a newer one
+    /// deletes nothing newer.
+    pub version: u64,
+    /// The `from_full_sync` these mutations' events carry: the caller's
+    /// [`Provenance`], and `true` for a recovery.
+    pub full_sync: bool,
+    /// The decoded mutations, in the order the collection applies them, SET
+    /// and REMOVE alike. Empty only for a snapshot or a recovery of an empty
+    /// collection.
+    pub mutations: &'a [Mutation],
+}
+
+/// What an [`AppStateBatch`] is, which decides what an index it lacks means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppStateBatchKind {
+    /// One patch: changes on top of the collection's previous version. An
+    /// index the patch does not name is unchanged.
+    Patch,
+    /// A snapshot: the whole collection at the batch's version. An index it
+    /// does not name no longer exists.
+    Snapshot,
+    /// The collection as the primary phone sent it back to recover it: the
+    /// whole collection at the batch's version, every record a SET.
+    Recovery,
+}
+
+/// Where a list's mutations come from, as their events report it in
+/// `from_full_sync`.
+///
+/// Only the caller knows: a rebuild from a snapshot spans several patch lists
+/// (`has_more_patches`), a full-sync request can rebuild a collection that
+/// already has a baseline, and a conflicting patch send absorbs a snapshot
+/// without its events calling it a full sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// Changes to a collection already synced: live patches, and what a
+    /// conflicting patch send absorbs, a snapshot included.
+    Live,
+    /// A rebuild of the collection from a snapshot: every list of it, the
+    /// pages after the one that carried the snapshot included.
+    FullSync,
+}
+
+impl Provenance {
+    /// [`Self::FullSync`] for `true`, as `from_full_sync` reads.
+    pub fn from_full_sync(full_sync: bool) -> Self {
+        if full_sync {
+            Self::FullSync
+        } else {
+            Self::Live
+        }
+    }
+
+    /// The `from_full_sync` the mutations' events carry.
+    pub fn is_full_sync(self) -> bool {
+        self == Self::FullSync
+    }
+}
+
+/// The caller's fence around the writes of one apply.
+///
+/// Asked before each write the processor makes to the collection, and `false`
+/// once the caller no longer stands behind it: its connection retired, and the
+/// disconnect cleared the reservation that kept the next connection's writers
+/// off the collection. [`AppStateProcessor::apply_snapshot_recovery`] takes the
+/// same predicate.
+pub type StillCurrentFn<'a> = dyn Fn() -> bool + Send + Sync + 'a;
+
+/// The fence of an apply nothing can retire: the entry points that apply one
+/// list on its own.
+const UNFENCED: &StillCurrentFn<'static> = &|| true;
 
 /// Return a complete `status_privacy` SET action with a mode.
 ///
@@ -236,6 +348,14 @@ struct PatchListProgress {
     state: HashState,
     committed_state: HashState,
     new_mutations: Vec<Mutation>,
+}
+
+/// What one call fixes for the whole of a list's apply, read by both phases.
+#[derive(Clone, Copy)]
+struct ApplyOptions<'a> {
+    validate_macs: bool,
+    provenance: Provenance,
+    still_current: &'a StillCurrentFn<'a>,
 }
 
 /// Validate collection metadata before admitting external downloads.
@@ -403,6 +523,13 @@ pub enum AppStateSyncError {
     Store(#[from] crate::store::error::StoreError),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+    /// The caller stopped standing behind the apply (its [`StillCurrentFn`]
+    /// answered `false`) before the collection's next write, so nothing more
+    /// was written. What the list committed before it comes back through
+    /// [`CommittedMutationsError`]; the rest is the collection's next sync's to
+    /// fetch, on whichever connection replaced this one.
+    #[error("app-state apply retired before writing the collection")]
+    Retired,
 }
 
 /// One outstanding ask, and the id the answer will carry back.
@@ -437,8 +564,9 @@ pub enum RecoveryOutcome {
     /// The collection had already moved past what the primary offered, so it was
     /// left alone.
     Stale { held: u64, offered: u64 },
-    /// The caller stopped standing behind the write before it began, so nothing
-    /// was touched.
+    /// The caller stopped standing behind the write before the collection was
+    /// written, so its rows were not touched. The records' effects were
+    /// persisted only if it stopped while they were being written.
     Retired,
 }
 
@@ -550,14 +678,31 @@ impl AppStateProcessor {
         self
     }
 
-    async fn persist_mutation_effects(&self, mutations: &[Mutation]) -> Result<()> {
+    /// A batch's effects, behind the caller's fence and in front of the
+    /// collection's first write for the batch: the status-privacy audience, the
+    /// `pnForLidChat` mappings, then the batch itself (all but an empty patch,
+    /// which changes nothing).
+    ///
+    /// `still_current` is asked before them, since the work that produced the
+    /// batch can take real time, and again after them, since they await the
+    /// device store and the host's commit. `Ok(false)` means the caller retired
+    /// and the collection must not be written.
+    async fn persist_mutation_effects(
+        &self,
+        batch: AppStateBatch<'_>,
+        still_current: &StillCurrentFn<'_>,
+    ) -> Result<bool> {
         let Some(persistence) = self.mutation_persistence.as_ref() else {
-            return Ok(());
+            return Ok(still_current());
         };
-        if let Some(action) = mutations.iter().rev().find_map(status_privacy_action) {
+        if !still_current() {
+            return Ok(false);
+        }
+        if let Some(action) = batch.mutations.iter().rev().find_map(status_privacy_action) {
             persistence.persist_status_privacy(action).await?;
         }
-        let mappings: Vec<_> = mutations
+        let mappings: Vec<_> = batch
+            .mutations
             .iter()
             .filter_map(pn_for_lid_chat_pair)
             .map(|(lid, pn)| (lid.user.to_string(), pn.user.to_string()))
@@ -565,7 +710,10 @@ impl AppStateProcessor {
         if !mappings.is_empty() {
             persistence.persist_lid_pn_mappings(mappings).await?;
         }
-        Ok(())
+        if batch.kind != AppStateBatchKind::Patch || !batch.mutations.is_empty() {
+            persistence.persist_mutations(batch).await?;
+        }
+        Ok(still_current())
     }
 
     /// How long one outstanding request suppresses another for the same
@@ -862,13 +1010,15 @@ impl AppStateProcessor {
     /// Trusting them is trusting the paired phone, over an end-to-end encrypted
     /// message, about an account it owns -- which is a weaker claim than the one
     /// already made by every key in the store.
-    /// `still_current` is asked once more, immediately before the first write.
-    /// Everything above it is reads and CPU and can be abandoned freely, but the
-    /// three writes below replace a collection, and what makes that safe is the
-    /// caller's exclusion of the other writers -- a reservation that a
-    /// disconnect drops wholesale. The checks the caller made before calling are
-    /// therefore stale by exactly the store lookups and the record work in
-    /// between, which is the part of this that can take real time.
+    /// `still_current` is asked twice more: before the records' effects (the
+    /// mutation persistence's calls, the first write) and again before the
+    /// collection's own rows. The reads and the CPU before them can be
+    /// abandoned freely, but the writes replace a collection, and what makes
+    /// that safe is the caller's exclusion of the other writers -- a
+    /// reservation that a disconnect drops wholesale. The checks the caller
+    /// made before calling are therefore stale by exactly the store lookups and
+    /// the record work in between, which is the part of this that can take
+    /// real time, and the effects await the device store and the host's commit.
     pub async fn apply_snapshot_recovery(
         &self,
         recovery: wa::SyncdSnapshotRecovery,
@@ -1086,10 +1236,22 @@ impl AppStateProcessor {
         })
         .await?;
 
-        // Asked again here, with the reads and the record work behind us and the
-        // first write in front. Whatever the caller checked before calling was
-        // true a key lookup and a whole collection's worth of HMACs ago.
-        if !still_current() {
+        // The records' effects first, as the snapshot path persists them, and
+        // behind the caller's fence: asked before them, with the reads and the
+        // record work behind us -- whatever the caller checked before calling
+        // was true a key lookup and a whole collection's worth of HMACs ago --
+        // and again after them, in front of the collection's first row. The
+        // effects repeat harmlessly with any later recovery, so a failure here
+        // leaves the collection exactly as it was. A recovery replaces the
+        // whole collection, which its events report as a full sync.
+        let batch = AppStateBatch {
+            collection: name,
+            kind: AppStateBatchKind::Recovery,
+            version,
+            full_sync: true,
+            mutations: &mutations,
+        };
+        if !self.persist_mutation_effects(batch, still_current).await? {
             return Ok(RecoveryOutcome::Retired);
         }
 
@@ -1101,7 +1263,6 @@ impl AppStateProcessor {
         if !macs.is_empty() {
             self.backend.put_mutation_macs(name, version, &macs).await?;
         }
-        self.persist_mutation_effects(&mutations).await?;
         self.backend
             .set_version(
                 name,
@@ -1174,6 +1335,13 @@ impl AppStateProcessor {
     ///
     /// If a later patch fails after earlier mutations were committed, the error
     /// downcasts to [`CommittedMutationsError`].
+    ///
+    /// The list is applied on its own: its mutations reach
+    /// [`AppStateMutationPersistence::persist_mutations`] as a full sync
+    /// exactly when it carries a snapshot, and nothing fences its writes. A
+    /// caller that pages one rebuild across several lists, or writes under a
+    /// reservation a disconnect can drop, passes its own provenance and fence
+    /// to [`Self::process_prepared_patch_list`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
@@ -1181,8 +1349,9 @@ impl AppStateProcessor {
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        let provenance = list_provenance(&pl);
         let prepared = self.prepare_patch_list(pl, download).await;
-        self.process_prepared_patch_list(prepared, validate_macs)
+        self.process_prepared_patch_list(prepared, validate_macs, provenance, UNFENCED)
             .await
     }
 
@@ -1266,10 +1435,22 @@ impl AppStateProcessor {
         .await
     }
 
+    /// Apply a prepared list, reporting each batch to
+    /// [`AppStateMutationPersistence::persist_mutations`] under `provenance`,
+    /// and writing the collection only while `still_current` holds.
+    ///
+    /// `provenance` is the one the caller dispatches these mutations under.
+    /// `still_current` is asked once the collection's state is read and around
+    /// each batch's effects, immediately before that batch's rows; once it
+    /// answers `false` the apply stops with [`AppStateSyncError::Retired`],
+    /// having written nothing more, and what it committed before comes back
+    /// through [`CommittedMutationsError`].
     pub async fn process_prepared_patch_list(
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
+        provenance: Provenance,
+        still_current: &StillCurrentFn<'_>,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let PreparedPatchList { list, error } = prepared;
         if let Some(error) = error {
@@ -1283,7 +1464,12 @@ impl AppStateProcessor {
                 .unwrap_or_default();
             return Ok((Vec::new(), state, list));
         }
-        Box::pin(self.process_patch_list(list, validate_macs)).await
+        let options = ApplyOptions {
+            validate_macs,
+            provenance,
+            still_current,
+        };
+        Box::pin(self.apply_patch_list(list, options)).await
     }
 
     /// Process already-parsed patch lists and download any external blobs.
@@ -1323,21 +1509,29 @@ impl AppStateProcessor {
     /// some boundary — a connection being replaced, a deadline running out —
     /// needs to be able to stop between collections rather than hand over a
     /// batch it can no longer take back.
+    ///
+    /// Reports a full sync exactly when the list carries a snapshot, and
+    /// applies unfenced, as [`Self::process_parsed_patch_list`] does.
     pub async fn process_one_patch_list(
         &self,
         pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        let provenance = list_provenance(&pl);
         let prepared = self.prepare_patch_list(pl, download).await;
-        self.process_one_prepared_patch_list(prepared, validate_macs)
+        self.process_one_prepared_patch_list(prepared, validate_macs, provenance, UNFENCED)
             .await
     }
 
+    /// [`Self::process_one_patch_list`] for a list already prepared, with the
+    /// caller's provenance and fence (see [`Self::process_prepared_patch_list`]).
     pub async fn process_one_prepared_patch_list(
         &self,
         prepared: PreparedPatchList,
         validate_macs: bool,
+        provenance: Provenance,
+        still_current: &StillCurrentFn<'_>,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let PreparedPatchList {
             list: mut pl,
@@ -1379,7 +1573,12 @@ impl AppStateProcessor {
             return Ok((Vec::new(), state, pl));
         }
 
-        Box::pin(self.process_patch_list(pl, validate_macs)).await
+        let options = ApplyOptions {
+            validate_macs,
+            provenance,
+            still_current,
+        };
+        Box::pin(self.apply_patch_list(pl, options)).await
     }
 
     /// Process one patch list whose external blobs have already been inlined.
@@ -1387,11 +1586,28 @@ impl AppStateProcessor {
     /// If a later patch fails after earlier mutations were committed, the error
     /// downcasts to [`CommittedMutationsError`]. Its mutations still require
     /// dispatch, and its state is the last committed cursor.
+    ///
+    /// Reports a full sync exactly when the list carries a snapshot, and
+    /// applies unfenced, as [`Self::process_parsed_patch_list`] does. Returned
+    /// as the apply's own future, so this entry point adds nothing to its size.
+    pub fn process_patch_list(
+        &self,
+        pl: PatchList,
+        validate_macs: bool,
+    ) -> impl Future<Output = Result<(Vec<Mutation>, HashState, PatchList)>> + '_ {
+        let options = ApplyOptions {
+            validate_macs,
+            provenance: list_provenance(&pl),
+            still_current: UNFENCED,
+        };
+        self.apply_patch_list(pl, options)
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
-    pub async fn process_patch_list(
+    async fn apply_patch_list(
         &self,
         mut pl: PatchList,
-        validate_macs: bool,
+        options: ApplyOptions<'_>,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
@@ -1401,6 +1617,14 @@ impl AppStateProcessor {
             .get_version(pl.name.as_str())
             .await?
             .unwrap_or_default();
+        // The caller's fence, asked once the collection is read and before
+        // anything is written. The writes below that no batch precedes -- the
+        // genesis clear, and the version a list without patches records --
+        // follow it with nothing in between, and each batch asks again around
+        // its own effects.
+        if !(options.still_current)() {
+            return Err(AppStateSyncError::Retired.into());
+        }
         let mut progress = Box::new(PatchListProgress {
             committed_state: state.clone(),
             state,
@@ -1433,7 +1657,7 @@ impl AppStateProcessor {
                 &mut pl,
                 keys_map.clone(),
                 &mut progress,
-                validate_macs,
+                options,
             ))
             .await?;
         }
@@ -1489,7 +1713,7 @@ impl AppStateProcessor {
                 collection_name,
                 keys_map.clone(),
                 &mut progress,
-                validate_macs,
+                options,
                 !pl.has_more_patches,
             ))
             .await
@@ -1662,10 +1886,11 @@ impl AppStateProcessor {
         pl: &mut PatchList,
         keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
         progress: &mut PatchListProgress,
-        validate_macs: bool,
+        options: ApplyOptions<'_>,
     ) -> Result<()> {
         let collection_name = pl.name.as_str();
         let collection_name_owned = collection_name.to_string();
+        let validate_macs = options.validate_macs;
 
         // Offload CPU-intensive snapshot processing to a blocking thread. The
         // snapshot moves into the closure (its 'static bound used to force a
@@ -1690,6 +1915,24 @@ impl AppStateProcessor {
         pl.snapshot = Some(snapshot);
         progress.state = snapshot_state;
 
+        // The mutations' effects before any of the collection's rows, behind the
+        // caller's fence: they repeat harmlessly when the snapshot is applied
+        // again, so a failure here leaves the collection as it was, its MAC rows
+        // included, and a caller that retired while they ran writes none of it.
+        let batch = AppStateBatch {
+            collection: collection_name,
+            kind: AppStateBatchKind::Snapshot,
+            version: progress.state.version,
+            full_sync: options.provenance.is_full_sync(),
+            mutations: &snapshot_result.mutations,
+        };
+        if !self
+            .persist_mutation_effects(batch, options.still_current)
+            .await?
+        {
+            return Err(AppStateSyncError::Retired.into());
+        }
+
         // A snapshot is a fresh baseline, so wipe the collection's prior mutation
         // MACs first, even when the snapshot has none. Leftover
         // index->value entries would corrupt the next patch's ltHash.
@@ -1708,8 +1951,6 @@ impl AppStateProcessor {
                 .await?;
         }
         progress.state.bootstrapped |= !pl.has_more_patches;
-        self.persist_mutation_effects(&snapshot_result.mutations)
-            .await?;
         self.backend
             .set_version(collection_name, progress.state.clone())
             .await?;
@@ -1731,9 +1972,10 @@ impl AppStateProcessor {
         collection_name: &str,
         keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
         progress: &mut PatchListProgress,
-        validate_macs: bool,
+        options: ApplyOptions<'_>,
         final_page: bool,
     ) -> Result<wa::SyncdPatch> {
+        let validate_macs = options.validate_macs;
         let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
         // Fetch previous value MACs in one backend round-trip instead of a
@@ -1771,8 +2013,22 @@ impl AppStateProcessor {
         if final_page {
             prepared.mark_bootstrapped();
         }
-        self.persist_mutation_effects(&prepared.result().mutations)
-            .await?;
+        // Behind the caller's fence, like the snapshot's: a caller that retired
+        // before or during the effects commits nothing over whatever the next
+        // connection has written since.
+        let batch = AppStateBatch {
+            collection: collection_name,
+            kind: AppStateBatchKind::Patch,
+            version: prepared.result().state.version,
+            full_sync: options.provenance.is_full_sync(),
+            mutations: &prepared.result().mutations,
+        };
+        if !self
+            .persist_mutation_effects(batch, options.still_current)
+            .await?
+        {
+            return Err(AppStateSyncError::Retired.into());
+        }
         self.backend
             .commit_patch(
                 collection_name,
@@ -1821,6 +2077,12 @@ impl AppStateProcessor {
 /// that decides.
 pub fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
     persisted_version > 0 && snapshot_version <= persisted_version
+}
+
+/// The provenance a list applied on its own reports: a full sync exactly when
+/// it carries a snapshot, inline or by reference.
+fn list_provenance(pl: &PatchList) -> Provenance {
+    Provenance::from_full_sync(pl.snapshot.is_some() || pl.snapshot_ref.is_some())
 }
 
 #[cfg(test)]
@@ -2154,13 +2416,18 @@ mod future_layout_tests {
             committed_state: HashState::default(),
             new_mutations: Vec::new(),
         };
+        let options = ApplyOptions {
+            validate_macs: true,
+            provenance: Provenance::Live,
+            still_current: UNFENCED,
+        };
         let snapshot = {
             let future = processor.apply_patch_list_snapshot(
                 wa::SyncdSnapshot::default(),
                 &mut pl,
                 keys.clone(),
                 &mut progress,
-                true,
+                options,
             );
             size_of_val(&future)
         };
@@ -2170,7 +2437,7 @@ mod future_layout_tests {
                 "regular",
                 keys,
                 &mut progress,
-                true,
+                options,
                 true,
             );
             size_of_val(&future)
@@ -2374,7 +2641,7 @@ mod prepared_validation_tests {
         );
         assert!(
             processor
-                .process_prepared_patch_list(prepared, false)
+                .process_prepared_patch_list(prepared, false, Provenance::Live, UNFENCED)
                 .await
                 .is_err()
         );
@@ -2396,7 +2663,7 @@ mod prepared_validation_tests {
                 .prepare_patch_list(list(snapshot.clone()), &|_| panic!("inline"))
                 .await;
             let error = processor
-                .process_prepared_patch_list(prepared, true)
+                .process_prepared_patch_list(prepared, true, Provenance::Live, UNFENCED)
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -2412,7 +2679,7 @@ mod prepared_validation_tests {
                 .prepare_patch_list(list(snapshot), &|_| panic!("inline"))
                 .await;
             let error = processor
-                .process_one_prepared_patch_list(prepared, true)
+                .process_one_prepared_patch_list(prepared, true, Provenance::Live, UNFENCED)
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -2439,7 +2706,7 @@ mod prepared_validation_tests {
             .prepare_metadata_validated_patch_list(validated, &|_| panic!("invalid metadata"))
             .await;
         let error = processor
-            .process_prepared_patch_list(prepared, true)
+            .process_prepared_patch_list(prepared, true, Provenance::Live, UNFENCED)
             .await
             .unwrap_err();
         assert_eq!(
@@ -2487,7 +2754,7 @@ mod prepared_validation_tests {
             .await;
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
         let error = processor
-            .process_prepared_patch_list(prepared, true)
+            .process_prepared_patch_list(prepared, true, Provenance::Live, UNFENCED)
             .await
             .unwrap_err();
         assert_eq!(
@@ -2526,7 +2793,7 @@ mod prepared_validation_tests {
             .await;
         assert_eq!(downloads.load(Ordering::SeqCst), 2);
         let error = processor
-            .process_prepared_patch_list(prepared, true)
+            .process_prepared_patch_list(prepared, true, Provenance::Live, UNFENCED)
             .await
             .unwrap_err();
         assert_eq!(

@@ -2484,6 +2484,10 @@ pub struct Client {
     pub(crate) history_sync_capture_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::HistorySyncCaptureHook>>,
 
+    /// Optional app-state commit before each cursor moves, fixed during
+    /// assembly; the app-state processor takes it when it is first built.
+    pub(crate) app_state_durability_hook: Option<Arc<dyn crate::AppStateDurabilityHook>>,
+
     /// Optional retry admission, fixed during assembly.
     pub(crate) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
 

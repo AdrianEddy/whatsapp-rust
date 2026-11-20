@@ -2,6 +2,7 @@
 pub use wacore::types::*;
 
 // Local type definitions
+pub mod app_state_durability;
 pub mod connect_admission;
 pub mod decrypt_failure_admission;
 pub mod durability_hook;

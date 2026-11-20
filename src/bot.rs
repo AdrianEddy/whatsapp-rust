@@ -9,6 +9,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
+use crate::types::app_state_durability::AppStateDurabilityHook;
 use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
@@ -1308,6 +1309,26 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self.client_builder = self
             .client_builder
             .with_group_notification_durability_hook_arc(hook);
+        self
+    }
+
+    /// Commit each patch's, snapshot's and recovery's app-state mutations
+    /// before the collection's cursor moves. See [`AppStateDurabilityHook`]
+    /// for replay, cancellation and reservation limits.
+    pub fn with_app_state_durability_hook<Ah>(mut self, hook: Ah) -> Self
+    where
+        Ah: AppStateDurabilityHook + 'static,
+    {
+        self.client_builder = self.client_builder.with_app_state_durability_hook(hook);
+        self
+    }
+
+    /// Register an already-shared app-state hook. The last registration wins.
+    pub fn with_app_state_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn AppStateDurabilityHook>,
+    ) -> Self {
+        self.client_builder = self.client_builder.with_app_state_durability_hook_arc(hook);
         self
     }
 

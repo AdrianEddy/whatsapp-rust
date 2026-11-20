@@ -15,7 +15,9 @@ pub(crate) use wacore::sync_engine::app_state::{
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
-use wacore::appstate_sync::{AppStateMutationPersistence, MetadataValidatedPatchList};
+use wacore::appstate_sync::{
+    AppStateBatch, AppStateMutationPersistence, MetadataValidatedPatchList, Provenance,
+};
 
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
@@ -97,6 +99,9 @@ fn external_blob_resolver(
 struct AppStateClientPersistence {
     client: std::sync::Weak<Client>,
     persistence: Arc<PersistenceManager>,
+    /// The host's commit, fixed at assembly and held here so the processor
+    /// reaches it without the client.
+    hook: Option<Arc<dyn crate::AppStateDurabilityHook>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -125,6 +130,13 @@ impl AppStateMutationPersistence for AppStateClientPersistence {
             .map_err(|error| {
                 wacore::store::error::StoreError::Io(std::io::Error::other(error.to_string()))
             })
+    }
+
+    async fn persist_mutations(&self, batch: AppStateBatch<'_>) -> Result<()> {
+        match &self.hook {
+            Some(hook) => hook.on_mutations(batch).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -628,6 +640,7 @@ impl Client {
                     .with_mutation_persistence(Arc::new(AppStateClientPersistence {
                         client: self.self_weak.get().cloned().unwrap_or_default(),
                         persistence: self.persistence_manager.clone(),
+                        hook: self.app_state_durability_hook.clone(),
                     })),
             )
         })
@@ -870,8 +883,14 @@ impl Client {
                 // Waits for any holder: this is a consumer asking for one named
                 // collection, and a sync already in flight is not necessarily
                 // fetching what it asked for.
+                //
+                // The scope is opened before the wait, so the generation it
+                // carries is one the reservation was taken under: a disconnect
+                // during the wait clears the registry only after moving the
+                // generation on, and the sync below then defers.
+                let scope = self.sync_scope(None);
                 let _guard = match self
-                    .reserve_for_sync(name, ReservationWait::Always, self.sync_scope(None))
+                    .reserve_for_sync(name, ReservationWait::Always, scope)
                     .await
                 {
                     Ok(guard) => guard,
@@ -898,7 +917,9 @@ impl Client {
                 // catch. A connection lost while the collection IQ is in flight
                 // is reported by `send_iq` as an error rather than as a
                 // deferral, and an error here used to be logged and dropped.
-                let outcome = self.process_app_state_sync_task(name, full_sync).await;
+                let outcome = self
+                    .process_app_state_sync_task(name, full_sync, scope.generation())
+                    .await;
                 match &outcome {
                     Err(e) => self.log_sync_error(&format!("app state sync for {name:?}"), e),
                     Ok(SyncOutcome::Deferred) => {
@@ -913,39 +934,45 @@ impl Client {
         }
     }
 
-    /// Sync one collection, retrying a missing decode key and a locked DB.
+    /// Sync one collection, retrying a missing decode key and a locked DB, and
+    /// handing whatever that leaves unsettled to the task retry scheduler.
     ///
     /// Takes no in-flight reservation of its own: the only caller is the patch
     /// send, which already holds the collection's reservation for the whole
     /// build-send-resolve cycle and would deadlock on its own guard. The
     /// batched path reserves its collections in
     /// [`sync_collections_batched`](Self::sync_collections_batched).
+    /// `generation` is the one that reservation was taken under, which fences
+    /// the sync's writes.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<SyncOutcome> {
+    async fn fetch_app_state_with_retry_inner(
+        &self,
+        name: WAPatchName,
+        generation: u64,
+    ) -> Result<SyncOutcome> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
-        loop {
+        let outcome = loop {
             attempt += 1;
             // full_sync=false lets process_app_state_sync_task auto-detect:
             // version 0 → snapshot (full sync), version > 0 → incremental patches.
             // Matches WA Web which only requests snapshot when version is undefined.
-            let res = self.process_app_state_sync_task(name, false).await;
+            let res = self
+                .process_app_state_sync_task(name, false, generation)
+                .await;
             match res {
                 Ok(SyncOutcome::Completed) => {
                     wacore::telemetry::appstate_sync("ok");
-                    return Ok(SyncOutcome::Completed);
+                    break Ok(SyncOutcome::Completed);
                 }
                 // The send succeeded and the collection is now behind its own
                 // head, which is precisely the state this re-sync exists to
                 // repair. Counting it as `ok` reported a repair that did not
-                // happen; the retry is what actually carries it to the
+                // happen; the retry below is what actually carries it to the
                 // replacement connection.
                 Ok(SyncOutcome::Deferred) => {
                     wacore::telemetry::appstate_sync("deferred");
-                    if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                        client.schedule_app_state_task_retry(name, false);
-                    }
-                    return Ok(SyncOutcome::Deferred);
+                    break Ok(SyncOutcome::Deferred);
                 }
                 Err(e) => {
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
@@ -986,10 +1013,25 @@ impl Client {
                         continue;
                     }
                     wacore::telemetry::appstate_sync("fail");
-                    return Err(e);
+                    break Err(e);
                 }
             }
+        };
+        // Only `Completed` settles the sync. A failure leaves the collection as
+        // far behind the server as a deferral does (after an accepted send,
+        // behind the send's own patch; and mutations whose commit failed, the
+        // host's refusal included, are still owed), and nothing else asks for
+        // it again: an ordinary reconnect runs no app-state sync, and the send
+        // only logs a failed re-sync, since its patch landed. The retry waits
+        // for a usable connection, reserves the collection once the send has
+        // released it and backs off within its budget, so a sync whose
+        // connection retired is retried on the replacement.
+        if sync_still_owed(&outcome)
+            && let Some(client) = self.self_weak.get().and_then(|w| w.upgrade())
+        {
+            client.schedule_app_state_task_retry(name, false);
         }
+        outcome
     }
 
     /// Log and surface a sync whose caller has no decision to make.
@@ -1121,6 +1163,42 @@ impl Client {
         scope.admits(self.connection_generation.load(Ordering::SeqCst), || {
             self.runtime.monotonic_time()
         })
+    }
+
+    /// The processor's fence for writes made under a reservation taken on
+    /// `generation`: true while that is still the live connection.
+    ///
+    /// A disconnect moves the generation on before it clears the reservation
+    /// registry, so with `generation` read before the reservation was taken, a
+    /// fence that holds means the reservation still keeps the other writers
+    /// off the collection. The generation alone, not a scope's deadline:
+    /// running out of time is not retirement. The counter, not `self`: the
+    /// predicate is `Send + Sync` so it can be held across the awaits inside
+    /// the apply, and `Client` carries trait objects that are neither on wasm.
+    fn generation_fence(&self, generation: u64) -> impl Fn() -> bool + Send + Sync + 'static {
+        let live = Arc::clone(&self.connection_generation);
+        move || live.load(Ordering::Acquire) == generation
+    }
+
+    /// Reserve `name` for `holder`, waiting for whoever holds it, and return
+    /// the generation the reservation stands behind.
+    ///
+    /// Read before the wait and confirmed after it, and reserved again under
+    /// the new one if a reconnect landed in between: a disconnect clears the
+    /// registry wholesale, so a guard taken before one excludes nothing, and
+    /// the generation is what [`Self::generation_fence`] fences the writes by.
+    async fn reserve_writer(
+        &self,
+        name: WAPatchName,
+        holder: SyncHolder,
+    ) -> (SyncInFlightGuard, u64) {
+        loop {
+            let generation = self.connection_generation.load(Ordering::Acquire);
+            let reservation = self.app_state_syncing.begin(name, holder).await;
+            if self.connection_generation.load(Ordering::Acquire) == generation {
+                return (reservation, generation);
+            }
+        }
     }
 
     /// Record whether the initial bootstrap still has work outstanding.
@@ -1379,7 +1457,9 @@ impl Client {
                     continue;
                 }
                 budget.record_attempt();
-                let outcome = client.process_app_state_sync_task(name, full_sync).await;
+                let outcome = client
+                    .process_app_state_sync_task(name, full_sync, scope.generation())
+                    .await;
                 if let Err(e) = &outcome {
                     drop(guard);
                     client.log_sync_error("app state task retry", e);
@@ -1889,6 +1969,12 @@ impl Client {
         // dispatched page two onward as live changes, which is what a consumer
         // reads `from_full_sync` to tell apart.
         let mut replaying_snapshot: HashSet<WAPatchName> = HashSet::new();
+        // What the processor asks before each write, so a list whose connection
+        // retires while it is applying -- inside the host's commit, typically --
+        // stops short of the collection's rows instead of writing them next to
+        // the replacement connection's. The admission checks below decide what
+        // starts; this decides what an apply already under way may still write.
+        let still_current = self.generation_fence(scope.generation());
 
         while !pending.is_empty()
             && let Some(iteration) = pages.next_page()
@@ -2168,9 +2254,17 @@ impl Client {
                         break;
                     }
                     let name = pl.list().name;
+                    // The provenance the dispatch below gives these mutations,
+                    // so the durability hook commits them under the same one.
+                    let provenance = Provenance::from_full_sync(replaying_snapshot.contains(&name));
                     (
                         name,
-                        Box::pin(proc.process_one_prepared_patch_list(pl, true)),
+                        Box::pin(proc.process_one_prepared_patch_list(
+                            pl,
+                            true,
+                            provenance,
+                            &still_current,
+                        )),
                     )
                 };
                 match processing.await {
@@ -2354,11 +2448,18 @@ impl Client {
         Ok(())
     }
 
+    /// Sync one collection under the caller's reservation of it.
+    ///
+    /// `generation` is the connection that reservation was taken on, read
+    /// before it was taken. A disconnect clears the registry, so from then on
+    /// the reservation excludes nothing; the sync defers at its next check,
+    /// and the processor stops short of the collection's next write.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync", level = "debug", skip_all, fields(name = ?name, full_sync = full_sync), err(Debug)))]
     pub(crate) async fn process_app_state_sync_task(
         &self,
         name: WAPatchName,
         full_sync: bool,
+        generation: u64,
     ) -> Result<SyncOutcome> {
         let authoritative = self.authoritative_app_state()?;
         if authoritative && full_sync {
@@ -2366,11 +2467,15 @@ impl Client {
                 "authoritative primary app-state cannot restore a server snapshot"
             ));
         }
-        // Two questions, where `is_shutting_down()` answered a blend of them: is
-        // the client finished, and can a request reach the server at all. A
-        // planned reconnect is neither — it clears `is_connected` and leaves
-        // everything else alone — so the work waits instead of stopping.
-        if self.is_terminal() || !self.can_reach_server() {
+        let still_current = self.generation_fence(generation);
+        // Three questions, where `is_shutting_down()` answered a blend of the
+        // first two: is the client finished, can a request reach the server at
+        // all, and is the connection still the one the reservation was taken
+        // on. A planned reconnect is none of them -- it clears `is_connected`
+        // and leaves everything else alone -- so the work waits instead of
+        // stopping. Reachability alone is true again as soon as a replacement
+        // connection logs in, while this task's reservation went with the old one.
+        if self.is_terminal() || !self.can_reach_server() || !still_current() {
             debug!(
                 target: "Client/AppState",
                 "Skipping app state sync task {name:?}: no usable connection"
@@ -2400,7 +2505,7 @@ impl Client {
         let mut outcome = SyncOutcome::Completed;
 
         while has_more {
-            if self.is_terminal() || !self.can_reach_server() {
+            if self.is_terminal() || !self.can_reach_server() || !still_current() {
                 debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
                 outcome = SyncOutcome::Deferred;
                 break;
@@ -2443,7 +2548,7 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            if self.is_terminal() || !self.can_reach_server() {
+            if self.is_terminal() || !self.can_reach_server() || !still_current() {
                 debug!(target: "Client/AppState", "Discarding app state sync response for {name:?}: no usable connection");
                 outcome = SyncOutcome::Deferred;
                 break;
@@ -2494,21 +2599,28 @@ impl Client {
                 ));
             }
 
-            let (mutations, new_state, list) =
-                match proc.process_prepared_patch_list(prepared, true).await {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        // The single-collection path fails the same way the batched
-                        // one does and deserves the same escalation; without it, a
-                        // collection would recover only when its failure happened to
-                        // arrive in a batch.
-                        let error = self
-                            .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
-                            .await;
-                        self.escalate_to_snapshot_recovery(name, &error).await;
-                        return Err(error);
-                    }
-                };
+            let (mutations, new_state, list) = match proc
+                .process_prepared_patch_list(
+                    prepared,
+                    true,
+                    Provenance::from_full_sync(full_sync),
+                    &still_current,
+                )
+                .await
+            {
+                Ok(applied) => applied,
+                Err(error) => {
+                    // The single-collection path fails the same way the batched
+                    // one does and deserves the same escalation; without it, a
+                    // collection would recover only when its failure happened to
+                    // arrive in a batch.
+                    let error = self
+                        .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                        .await;
+                    self.escalate_to_snapshot_recovery(name, &error).await;
+                    return Err(error);
+                }
+            };
             let decode_elapsed = self
                 .runtime
                 .monotonic_time()
@@ -2919,14 +3031,15 @@ impl Client {
         // would leave the ltHash disagreeing with the MAC store — the very
         // divergence #1156 is about. Waits rather than skipping, and the
         // re-syncs below go through `_inner` because this task already holds
-        // the reservation they would otherwise take.
-        let _collection_guard = match patch_name {
-            Some(name) => Some(
-                self.app_state_syncing
-                    .begin(name, SyncHolder::PatchSend)
-                    .await,
-            ),
-            None => None,
+        // the reservation they would otherwise take. They and the conflict
+        // absorb write under the generation it was taken on, so a reconnect
+        // in the middle of the send stops them short of the collection's rows.
+        let (_collection_guard, generation) = match patch_name {
+            Some(name) => {
+                let (guard, generation) = self.reserve_writer(name, SyncHolder::PatchSend).await;
+                (Some(guard), generation)
+            }
+            None => (None, self.connection_generation.load(Ordering::Acquire)),
         };
         let proc = self.get_app_state_processor();
 
@@ -2952,7 +3065,9 @@ impl Client {
                 // and then deferred leaves one behind while the collection is
                 // still short of the head, and a patch built on that base is the
                 // 409 this guard exists to avoid.
-                let synced = self.fetch_app_state_with_retry_inner(name).await?;
+                let synced = self
+                    .fetch_app_state_with_retry_inner(name, generation)
+                    .await?;
                 if synced != SyncOutcome::Completed
                     || !backend
                         .get_version(collection_name)
@@ -3044,10 +3159,16 @@ impl Client {
                 None => {
                     // Re-sync to pick up whatever else moved while we were sending.
                     // Matches whatsmeow's fetchAppState after a successful send.
+                    // Its failure is not the send's: the patch landed, and the
+                    // re-sync has scheduled its own retry.
                     if let Some(patch_name) = patch_name
-                        && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
+                        && let Err(e) = self
+                            .fetch_app_state_with_retry_inner(patch_name, generation)
+                            .await
                     {
-                        log::warn!("Failed to re-sync {collection_name} after patch send: {e}");
+                        log::warn!(
+                            "Failed to re-sync {collection_name} after patch send, retrying in the background: {e}"
+                        );
                     }
                     return Ok(());
                 }
@@ -3072,6 +3193,7 @@ impl Client {
                             list,
                             has_more,
                             authoritative,
+                            generation,
                         )
                         .await
                     {
@@ -3103,6 +3225,9 @@ impl Client {
     /// fallback that advances the base. Either way the caller retries; the only
     /// unrecoverable outcome is making no progress, which the attempt cap turns
     /// into an error rather than a silent drop.
+    ///
+    /// `generation` is the one the send's reservation was taken on, which
+    /// fences the apply and the re-sync alike.
     async fn absorb_conflicting_patches(
         &self,
         collection_name: &str,
@@ -3110,6 +3235,7 @@ impl Client {
         mut list: wacore::appstate::patch_decode::PatchList,
         has_more: bool,
         authoritative: bool,
+        generation: u64,
     ) -> Recovery {
         discard_authoritative_snapshot(&mut list, authoritative);
         // What the recovery has to move, read before anything can move it.
@@ -3138,7 +3264,15 @@ impl Client {
             let proc = self.get_app_state_processor();
             let prepared =
                 Box::pin(proc.prepare_metadata_validated_patch_list(list, &download)).await;
-            match proc.process_prepared_patch_list(prepared, true).await {
+            match proc
+                .process_prepared_patch_list(
+                    prepared,
+                    true,
+                    Provenance::Live,
+                    &self.generation_fence(generation),
+                )
+                .await
+            {
                 // The third element is the processor's own verdict, and it is
                 // not always agreement: a collection with an empty ltHash and a
                 // non-genesis first patch is refused here, with `Retry` set and
@@ -3203,7 +3337,10 @@ impl Client {
                     "{collection_name} is not a known collection, so its conflict cannot be resolved"
                 ));
             };
-            match self.fetch_app_state_with_retry_inner(patch_name).await {
+            match self
+                .fetch_app_state_with_retry_inner(patch_name, generation)
+                .await
+            {
                 // The base is where it was and the re-sync is the only thing that
                 // could have moved it. A snapshot MAC that will not validate
                 // fails this way every time, so the remaining attempts are the
@@ -3402,20 +3539,12 @@ impl Client {
         // stands down as covered and files the collection as skipped, never to
         // retry it; finding a writer, it waits and then fetches what this did
         // not.
-        let Ok((_reservation, generation)) =
-            rt_timeout(&*self.runtime, APP_STATE_RESERVATION_WAIT, async {
-                loop {
-                    let generation = self.connection_generation.load(Ordering::Acquire);
-                    let reservation = self
-                        .app_state_syncing
-                        .begin(patch_name, RECOVERY_HOLDER)
-                        .await;
-                    if self.connection_generation.load(Ordering::Acquire) == generation {
-                        return (reservation, generation);
-                    }
-                }
-            })
-            .await
+        let Ok((_reservation, generation)) = rt_timeout(
+            &*self.runtime,
+            APP_STATE_RESERVATION_WAIT,
+            self.reserve_writer(patch_name, RECOVERY_HOLDER),
+        )
+        .await
         else {
             warn!(
                 target: "Client/AppState",
@@ -3431,12 +3560,9 @@ impl Client {
         // disconnect anywhere in there drops the registry wholesale, so the
         // reservation held here stops excluding the new connection's own sync
         // from the very rows about to be written. So the apply asks again, on
-        // the far side of that work and in front of the first write.
-        // The counter, not `self`: the predicate is `Send + Sync` so it can be
-        // held across the awaits inside the apply, and `Client` carries trait
-        // objects that are neither on wasm.
-        let live = Arc::clone(&self.connection_generation);
-        let still_current = move || live.load(Ordering::Acquire) == generation;
+        // the far side of that work: before the records' effects, the first
+        // write, and once more in front of the collection's own rows.
+        let still_current = self.generation_fence(generation);
         // The recovery's own version, read above before
         // `apply_snapshot_recovery` moves `recovery`: it is the post-apply
         // cursor for the semantic context below. `apply_snapshot_recovery`
@@ -3481,7 +3607,7 @@ impl Client {
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
                 info!(
                     target: "Client/AppState",
-                    "Discarding the primary's {name} at v{recovery_version}: the connection went while it was being prepared; syncing it instead"
+                    "Discarding the primary's {name} at v{recovery_version}: the connection went before the collection was written; syncing it instead"
                 );
                 self.converge_after_dropped_recovery_weak(patch_name);
             }
@@ -6245,7 +6371,11 @@ mod send_patch_response_tests {
                             .map(|_| ())
                     } else {
                         client
-                            .process_app_state_sync_task(WAPatchName::CriticalBlock, false)
+                            .process_app_state_sync_task(
+                                WAPatchName::CriticalBlock,
+                                false,
+                                client.sync_scope(None).generation(),
+                            )
                             .await
                             .map(|_| ())
                     }
@@ -6330,7 +6460,11 @@ mod send_patch_response_tests {
         );
         assert!(
             client
-                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .process_app_state_sync_task(
+                    WAPatchName::Regular,
+                    false,
+                    client.sync_scope(None).generation(),
+                )
                 .await
                 .is_err()
         );
@@ -6377,7 +6511,11 @@ mod send_patch_response_tests {
             .unwrap();
         assert!(
             client
-                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .process_app_state_sync_task(
+                    WAPatchName::Regular,
+                    true,
+                    client.sync_scope(None).generation(),
+                )
                 .await
                 .is_err()
         );
@@ -7862,7 +8000,11 @@ mod task_retry_tests {
         );
         assert!(
             client
-                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .process_app_state_sync_task(
+                    WAPatchName::Regular,
+                    true,
+                    client.sync_scope(None).generation(),
+                )
                 .await
                 .is_ok(),
             "the callee reports Ok without doing anything, which is the trap"
@@ -8378,7 +8520,11 @@ mod sync_outcome_tests {
         );
         assert_eq!(
             client
-                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .process_app_state_sync_task(
+                    WAPatchName::Regular,
+                    true,
+                    client.sync_scope(None).generation(),
+                )
                 .await
                 .expect("skipping is not an error"),
             SyncOutcome::Deferred,
@@ -8395,7 +8541,11 @@ mod sync_outcome_tests {
 
         assert_eq!(
             client
-                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .process_app_state_sync_task(
+                    WAPatchName::Regular,
+                    false,
+                    client.sync_scope(None).generation(),
+                )
                 .await
                 .expect("skipping is not an error"),
             SyncOutcome::Deferred
@@ -9327,6 +9477,7 @@ mod critical_bootstrap_tests {
         AppStateClientPersistence {
             client: Arc::downgrade(&client),
             persistence: client.persistence_manager.clone(),
+            hook: None,
         }
         .persist_lid_pn_mappings(pairs)
         .await
@@ -9379,6 +9530,7 @@ mod critical_bootstrap_tests {
         AppStateClientPersistence {
             client: Arc::downgrade(&client),
             persistence: client.persistence_manager.clone(),
+            hook: None,
         }
         .persist_lid_pn_mappings(vec![(lid.user.to_string(), pn.user.to_string())])
         .await
@@ -9714,6 +9866,10 @@ mod download_memory_tests;
 #[cfg(test)]
 #[path = "app_state/future_layout_tests.rs"]
 mod future_layout_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "app_state/mc_tests.rs"]
+mod mc_tests;
 
 #[cfg(test)]
 mod validation_prefetch_tests {

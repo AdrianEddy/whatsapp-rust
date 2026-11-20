@@ -8,6 +8,7 @@
 //! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
 //! | Admitted history chunks | [`HistorySyncCaptureHook`], registered separately |
 //! | History notifications with restart recovery | [`crate::HistorySyncDurabilityHook`] |
+//! | App-state patches, snapshots and recoveries | [`crate::AppStateDurabilityHook`], before the cursor moves |
 //! | Callbacks/event subscriptions | Observers, not durable capture |
 //!
 //! Each hook defines its own idempotence, cancellation and replay limits.

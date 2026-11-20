@@ -20,6 +20,7 @@ use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
+use crate::types::app_state_durability::AppStateDurabilityHook;
 use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
@@ -442,6 +443,26 @@ impl ClientBuilder {
         hook: Arc<dyn GroupNotificationDurabilityHook>,
     ) -> Self {
         self.extensions_mut().group_notification_durability_hook = Some(hook);
+        self
+    }
+
+    /// Commit each patch's, snapshot's and recovery's app-state mutations
+    /// before the collection's cursor moves. See [`AppStateDurabilityHook`]
+    /// for replay, cancellation and reservation limits.
+    pub fn with_app_state_durability_hook<Ah>(mut self, hook: Ah) -> Self
+    where
+        Ah: AppStateDurabilityHook + 'static,
+    {
+        self.extensions_mut().app_state_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register an already-shared app-state hook. The last registration wins.
+    pub fn with_app_state_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn AppStateDurabilityHook>,
+    ) -> Self {
+        self.extensions_mut().app_state_durability_hook = Some(hook);
         self
     }
 
@@ -1169,6 +1190,7 @@ pub(super) struct ClientExtensions {
     pub(super) history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
     pub(super) history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     pub(super) group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
+    pub(super) app_state_durability_hook: Option<Arc<dyn AppStateDurabilityHook>>,
     pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
     pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
     pub(super) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
