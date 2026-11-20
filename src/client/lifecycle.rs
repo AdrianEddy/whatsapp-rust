@@ -710,7 +710,11 @@ impl Client {
             pause_generation: AtomicU64::new(0),
             connection_publish: Mutex::new(()),
 
-            needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
+            needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(
+                persistence_manager
+                    .get_device_snapshot()
+                    .initial_full_sync_owed,
+            )),
 
             app_state_processor: std::sync::OnceLock::new(),
             app_state_key_requests: Mutex::new(HashMap::new()),

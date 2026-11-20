@@ -89,6 +89,7 @@ diesel::table! {
         server_client_expiration -> Nullable<Text>,
         status_privacy -> Nullable<Binary>,
         mobile_session_binding -> Nullable<Binary>,
+        initial_full_sync_owed -> Bool,
     }
 }
 

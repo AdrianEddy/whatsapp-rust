@@ -423,6 +423,17 @@ pub struct Device {
     /// completes; `false` (WA default `all`) sends plain `read`/`played`.
     #[serde(default)]
     pub read_receipts_disabled: bool,
+    /// Whether the critical app-state bootstrap that linking asks for (WA Web's
+    /// `syncCriticalData`) is still owed. Pairing sets it in the same write as
+    /// the new identity, and each bootstrap outcome the client records writes
+    /// its in-memory gate's state back here, so it clears only once a bootstrap
+    /// completes. A client built over this device starts with its gate armed
+    /// from it, so one that did not pair the device (after a restart, or when
+    /// a host pairs with one client and serves the account with another) still
+    /// runs the bootstrap pairing owed. Records written before this field
+    /// existed read `false`, which is what every client assumed of them.
+    #[serde(default)]
+    pub initial_full_sync_owed: bool,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -639,6 +650,7 @@ impl Device {
             server_client_expiration: None,
             last_signed_pre_key_rotation_ms: now(),
             read_receipts_disabled: false,
+            initial_full_sync_owed: false,
         }
     }
 
@@ -798,6 +810,7 @@ impl Device {
             server_client_expiration: None,
             last_signed_pre_key_rotation_ms: 0,
             read_receipts_disabled: false,
+            initial_full_sync_owed: false,
         })
     }
 

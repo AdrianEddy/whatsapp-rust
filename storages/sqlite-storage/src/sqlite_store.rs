@@ -113,6 +113,7 @@ struct DeviceRow {
         select_expression_type = crate::bounded_mobile_binding::GuardedMobileBindingExpression
     )]
     mobile_session_binding: crate::bounded_mobile_binding::GuardedMobileBinding,
+    initial_full_sync_owed: bool,
 }
 
 /// One account in a database that holds several, as [`crate::SqliteDatabase::list_devices`]
@@ -176,6 +177,7 @@ struct FreshDeviceRow {
     server_client_expiration: Option<String>,
     status_privacy: Option<Vec<u8>>,
     mobile_session_binding: Option<Vec<u8>>,
+    initial_full_sync_owed: bool,
 }
 
 impl FreshDeviceRow {
@@ -218,6 +220,7 @@ impl FreshDeviceRow {
                 .transpose()
                 .map_err(|e| StoreError::Serialization(Box::new(e)))?,
             status_privacy: None,
+            initial_full_sync_owed: false,
         })
     }
 
@@ -249,6 +252,7 @@ impl FreshDeviceRow {
         row.login_counter = supplied.login_counter;
         row.lid_migrated = supplied.lid_migrated;
         row.read_receipts_disabled = supplied.read_receipts_disabled;
+        row.initial_full_sync_owed = supplied.initial_full_sync_owed;
         row.server_client_expiration = supplied
             .server_client_expiration
             .as_ref()
@@ -1862,6 +1866,7 @@ impl SqliteStore {
         let lid_migrated = device_data.lid_migrated;
         let last_signed_pre_key_rotation_ms = device_data.last_signed_pre_key_rotation_ms;
         let read_receipts_disabled = device_data.read_receipts_disabled;
+        let initial_full_sync_owed = device_data.initial_full_sync_owed;
         let new_lid: Arc<str> = Arc::from(
             device_data
                 .lid
@@ -1930,6 +1935,7 @@ impl SqliteStore {
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                         device::read_receipts_disabled.eq(read_receipts_disabled),
                         device::server_client_expiration.eq(server_client_expiration.as_deref()),
+                        device::initial_full_sync_owed.eq(initial_full_sync_owed),
                     ))
                     .on_conflict(device::id)
                     .do_update()
@@ -1968,6 +1974,7 @@ impl SqliteStore {
                         device::read_receipts_disabled.eq(excluded(device::read_receipts_disabled)),
                         device::server_client_expiration
                             .eq(excluded(device::server_client_expiration)),
+                        device::initial_full_sync_owed.eq(excluded(device::initial_full_sync_owed)),
                     ))
                     .execute(conn)
                     .map(|_| ())
@@ -2040,6 +2047,7 @@ impl SqliteStore {
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                         device::read_receipts_disabled.eq(false),
                         device::server_client_expiration.eq(None::<&str>),
+                        device::initial_full_sync_owed.eq(false),
                     ))
                     .execute(conn)
                     .map(|_| device_id)
@@ -2356,6 +2364,7 @@ impl SqliteStore {
                     .server_client_expiration
                     .as_deref()
                     .and_then(|raw| serde_json::from_str(raw).ok()),
+                initial_full_sync_owed: row.initial_full_sync_owed,
             }))
         } else {
             Ok(None)
@@ -8173,8 +8182,22 @@ mod tests {
             row.pn = pn;
             row.insert(&mut conn).unwrap();
         }
+        // The binding's migration is the one these tests roll back, so the
+        // migrations after it are reverted first; each drops only what it added.
+        while conn
+            .applied_migrations()
+            .unwrap()
+            .iter()
+            .any(|version| version.to_string().as_str() > MOBILE_BINDING_MIGRATION)
+        {
+            conn.revert_last_migration(MIGRATIONS).unwrap();
+        }
         conn
     }
+
+    /// The version of `add_mobile_session_binding`, the migration with a
+    /// rollback guard.
+    const MOBILE_BINDING_MIGRATION: &str = "20261105000000";
 
     #[test]
     fn mobile_binding_rollback_preserves_rows_schema_and_metadata_until_explicitly_cleared() {
@@ -8221,7 +8244,7 @@ mod tests {
                 .unwrap();
             let cleared_data = mobile_rollback_table_snapshot(&mut conn, "device", false);
             let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
-            assert_eq!(reverted.to_string(), "20261105000000");
+            assert_eq!(reverted.to_string(), MOBILE_BINDING_MIGRATION);
             assert_eq!(
                 mobile_rollback_table_snapshot(&mut conn, "device", true),
                 cleared_data,
@@ -8252,7 +8275,7 @@ mod tests {
         let before_metadata =
             mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true);
         let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
-        assert_eq!(reverted.to_string(), "20261105000000");
+        assert_eq!(reverted.to_string(), MOBILE_BINDING_MIGRATION);
         assert_eq!(
             mobile_rollback_table_snapshot(&mut conn, "device", true),
             before_data

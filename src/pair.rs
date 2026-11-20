@@ -428,6 +428,11 @@ async fn handle_pair_success<'a>(
                     device.account = Some(Arc::new(signed_identity_for_event.clone()));
                     device.lid = Some(lid.clone());
                     device.server_has_prekeys = false;
+                    // In the identity's own write, not after it: a record that
+                    // holds the new identity without the debt would let the
+                    // next client built over it skip the bootstrap. This
+                    // client's gate is armed below, after the reply.
+                    device.initial_full_sync_owed = true;
                     if !business_name.is_empty() {
                         device.push_name = business_name.clone();
                     }
@@ -587,7 +592,7 @@ pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_iq_test_client, poll_until};
     use wacore::pair_code::PairCodeState;
@@ -596,7 +601,7 @@ mod tests {
 
     // Primary-side fixture messages have decode-only production codecs.
     #[allow(clippy::disallowed_methods)]
-    fn signed_pair_success(client: &Client) -> Node {
+    pub(crate) fn signed_pair_success(client: &Client) -> Node {
         use buffa::Message;
         use hmac::{KeyInit, Mac};
         use waproto::whatsapp as wa;

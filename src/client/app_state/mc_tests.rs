@@ -12,6 +12,12 @@
 //! Patches are signed as the server's would be (index, content, snapshot and
 //! patch MACs), since the client validates every MAC; IQs are answered over the
 //! capturing transport, as `test_utils::create_iq_test_client` does.
+//!
+//! WF10 at the end: the critical bootstrap pairing owes is recorded in the
+//! device record with the new identity, so a client built over the device
+//! after the one that paired it runs that bootstrap, once, and the pairing
+//! client itself behaves as before. Over a store that already holds the
+//! app-state key, that client starts it without waiting for a key share.
 
 use super::*;
 use crate::client::ClientBuilder;
@@ -29,8 +35,8 @@ use wacore::appstate_sync::AppStateSyncError;
 use wacore::handshake::NoiseCipher;
 use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
 use wacore::store::traits::{AppStateSyncKey, Backend};
-use wacore::types::events::{Event, EventHandler, EventInterest, Subscription};
-use wacore_binary::node::Node;
+use wacore::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
+use wacore_binary::node::{Node, NodeContent};
 
 const COLLECTION: WAPatchName = WAPatchName::Regular;
 const KEY_ID: &[u8] = b"wf3-client-key";
@@ -937,4 +943,409 @@ async fn app_state_hook_last_registration_wins() {
     assert!(!Arc::ptr_eq(&installed, &shared));
 
     assert!(build_with(|builder| builder).await.is_none());
+}
+
+// WF10: the bootstrap pairing owes, recorded with the identity.
+
+/// The business name the pairing carries. A business account's push name
+/// comes from pairing, so the push-name trigger stays off and the bootstrap
+/// gate alone decides whether a connection runs the critical bootstrap.
+const BUSINESS_NAME: &str = "WF10 Business";
+
+/// The pairing fixture's signed `pair-success`, for a business account.
+fn business_pair_success(client: &Client) -> Node {
+    let mut iq = pair::tests::signed_pair_success(client);
+    let Some(NodeContent::Nodes(children)) = &mut iq.content else {
+        panic!("the fixture's iq holds its pair-success");
+    };
+    let Some(NodeContent::Nodes(success)) = &mut children[0].content else {
+        panic!("the fixture's pair-success holds its identity");
+    };
+    success.push(NodeBuilder::new("biz").attr("name", BUSINESS_NAME).build());
+    iq
+}
+
+/// What a client sends, frame by frame in wire order, as its sent-frame tap
+/// hands each one over once the transport has taken it. `serve_until` waits
+/// for the next frame rather than polling for it, so the test's task is idle
+/// exactly when the client's are, and a paused clock moves only on the
+/// client's own timers.
+struct Frames {
+    sent: async_channel::Receiver<bytes::Bytes>,
+    _forwarding: SentFrameLease,
+    _subscription: Subscription,
+}
+
+/// Feeds a [`Frames`].
+struct FrameFeed(async_channel::Sender<bytes::Bytes>);
+
+impl EventHandler for FrameFeed {
+    fn handle_event(&self, event: Arc<Event>) {
+        if let Event::SentFrame(frame) = &*event {
+            // Unbounded: it fails only once the test has stopped reading.
+            let _ = self.0.try_send(frame.plaintext.clone());
+        }
+    }
+
+    fn interest(&self) -> EventInterest {
+        EventInterest::of(&[EventKind::SentFrame])
+    }
+}
+
+/// A client over `backend`, connected over the capturing transport, and the
+/// frames it sends, once its mapping warmup has settled: a late one would
+/// retire a sync scope taken before it published.
+async fn client_over(backend: &Arc<dyn Backend>) -> (Arc<Client>, Frames) {
+    let (client, _transport) =
+        crate::test_utils::create_iq_test_client_with_backend(backend.clone()).await;
+    while !client.lid_pn_cache.startup_finished_for_tests() {
+        tokio::task::yield_now().await;
+    }
+    drop(client.lid_pn_cache.lock_mutation().await);
+    let (feed, sent) = async_channel::unbounded();
+    let frames = Frames {
+        sent,
+        _forwarding: client.acquire_sent_frame_forwarding(),
+        _subscription: client.subscribe_handler(Arc::new(FrameFeed(feed))),
+    };
+    (client, frames)
+}
+
+/// Pairs `client` as a business account.
+async fn pair(client: &Arc<Client>) {
+    let iq = business_pair_success(client);
+    assert!(pair::handle_iq(client, &iq.as_node_ref()).await);
+    let paired = client.persistence_manager.get_device_snapshot();
+    assert!(paired.pn.is_some(), "the pairing committed");
+    assert_eq!(paired.push_name, BUSINESS_NAME);
+}
+
+/// Pairs a client over `backend` and shuts it down before the reconnect that
+/// would log it in, as a host that pairs with one client and serves the
+/// account with another does. The shutdown saves the device.
+async fn pair_and_close(backend: &Arc<dyn Backend>) {
+    let (client, _frames) = client_over(backend).await;
+    pair(&client).await;
+    client
+        .shutdown()
+        .await
+        .device
+        .expect("the shutdown saves the device");
+    let stored = stored_device(backend).await;
+    assert!(stored.pn.is_some(), "the stored record holds the identity");
+    assert!(
+        stored.initial_full_sync_owed,
+        "and, written with it, the bootstrap it owes"
+    );
+}
+
+/// The device record as the store holds it.
+async fn stored_device(backend: &Arc<dyn Backend>) -> wacore::store::Device {
+    backend
+        .load()
+        .await
+        .expect("the test store reads")
+        .expect("a device row")
+}
+
+/// Logs `client` in on a new connection: the one the 515 after pairing, or a
+/// later reconnect, brings up. Its offline backlog is drained and the
+/// primary's app-state key share has reached this process, so the post-login
+/// sequence waits on nothing but the IQs `serve_until` answers.
+async fn log_in(client: &Arc<Client>) {
+    client
+        .initial_app_state_keys_received
+        .store(true, Ordering::SeqCst);
+    log_in_without_key_share(client).await;
+}
+
+/// [`log_in`] in a process the primary's key share has not reached, as in any
+/// process after the one that received it: whether the bootstrap waits for
+/// the share is the client's own decision.
+async fn log_in_without_key_share(client: &Arc<Client>) {
+    client.clear_expected_session_disconnect();
+    client.advance_generation_for_test(1, Ordering::SeqCst);
+    client.invalidate_session_authentication();
+    client.offline_sync_completed.store(true, Ordering::SeqCst);
+    let success = NodeBuilder::new("success").build();
+    client.handle_success(&success.as_node_ref()).await;
+}
+
+/// What a connection sent while `serve_until` answered it.
+#[derive(Default)]
+struct Wire {
+    /// Each app-state sync answered, as the collections it asked for, sorted.
+    app_state: Vec<Vec<String>>,
+    /// `<presence>` stanzas. A connection that owes no bootstrap announces the
+    /// session with one first; the bootstrap sends none before its syncs.
+    presences: usize,
+}
+
+impl Wire {
+    /// Whether the connection has shown which path it took.
+    fn decided(&self) -> bool {
+        !self.app_state.is_empty() || self.presences > 0
+    }
+}
+
+fn sorted(names: &[WAPatchName]) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().map(|name| name.as_str().to_string()).collect();
+    names.sort();
+    names
+}
+
+/// The bootstrap's two syncs: the critical collections, then the rest.
+fn bootstrap_syncs() -> Vec<Vec<String>> {
+    vec![
+        sorted(&[WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow]),
+        sorted(&[
+            WAPatchName::RegularLow,
+            WAPatchName::RegularHigh,
+            WAPatchName::Regular,
+        ]),
+    ]
+}
+
+/// Answers the client's requests in the order they reach the wire until `done`
+/// holds: an app-state sync with every collection it names, clean (synced,
+/// nothing new), any other request with an empty result. It waits on the
+/// client's frames, never on a clock.
+async fn serve_until(
+    client: &Arc<Client>,
+    frames: &Frames,
+    wire: &mut Wire,
+    done: impl Fn(&Wire) -> bool,
+) {
+    while !done(wire) {
+        let plaintext = frames
+            .sent
+            .recv()
+            .await
+            .expect("the feed lives as long as its subscription");
+        let node = wacore_binary::marshal::unmarshal_packed_ref(&plaintext)
+            .expect("a sent frame decodes as the stanza it carried");
+        if node.tag.as_ref() == "presence" {
+            wire.presences += 1;
+            continue;
+        }
+        let request = node.tag.as_ref() == "iq"
+            && matches!(
+                node.attrs().optional_string("type").as_deref(),
+                Some("get" | "set")
+            );
+        if !request {
+            continue;
+        }
+        let id = node
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        // An IQ's waiter is registered before the IQ is sent, so a request
+        // without one is one nobody waits for any more.
+        if !client.response_waiters_guard().contains_key(&id) {
+            continue;
+        }
+        if node.attrs().optional_string("xmlns").as_deref() == Some("w:sync:app:state") {
+            let mut names: Vec<String> = node
+                .get_optional_child("sync")
+                .expect("an app-state sync names its collections")
+                .get_children_by_tag("collection")
+                .map(|collection| {
+                    collection
+                        .attrs()
+                        .optional_string("name")
+                        .expect("a collection has a name")
+                        .into_owned()
+                })
+                .collect();
+            let clean: Vec<(&str, Option<&str>)> =
+                names.iter().map(|name| (name.as_str(), None)).collect();
+            crate::test_utils::answer_iq(client, &id, &batch_result(&id, &clean)).await;
+            names.sort();
+            wire.app_state.push(names);
+        } else {
+            let answer = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", id.as_str())
+                .attr("from", "s.whatsapp.net")
+                .build();
+            crate::test_utils::answer_iq(client, &id, &answer).await;
+        }
+    }
+}
+
+/// Waits until the stored device record says `owed`: the save of the
+/// bootstrap's last settle.
+async fn stored_owed_reaches(backend: &Arc<dyn Backend>, owed: bool) {
+    while stored_device(backend).await.initial_full_sync_owed != owed {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A client built over a device whose pairing client was shut down before its
+/// first login starts with the bootstrap armed, and runs it on its first
+/// connection, as the pairing client would have after its 515.
+#[tokio::test]
+async fn bootstrap_owed_survives_client_rebuild() {
+    let backend = crate::test_utils::create_test_backend().await;
+    pair_and_close(&backend).await;
+
+    let (client, frames) = client_over(&backend).await;
+    assert!(
+        client.needs_initial_full_sync.is_armed(),
+        "the gate starts from the record that owes the bootstrap"
+    );
+    let mut wire = Wire::default();
+    log_in(&client).await;
+    serve_until(&client, &frames, &mut wire, Wire::decided).await;
+    assert_eq!(
+        wire.app_state,
+        bootstrap_syncs()[..1],
+        "the first login syncs the critical collections"
+    );
+    assert_eq!(wire.presences, 0, "before announcing the session");
+}
+
+/// The bootstrap's completion clears the record as well as the gate, and saves
+/// it: neither a later connection of the same client nor a client built after
+/// it runs the bootstrap again.
+#[tokio::test]
+async fn bootstrap_cleared_after_completion() {
+    let backend = crate::test_utils::create_test_backend().await;
+    pair_and_close(&backend).await;
+
+    let (client, frames) = client_over(&backend).await;
+    let mut first = Wire::default();
+    log_in(&client).await;
+    serve_until(&client, &frames, &mut first, |wire| {
+        wire.app_state.len() == 2
+    })
+    .await;
+    assert_eq!(first.app_state, bootstrap_syncs());
+    stored_owed_reaches(&backend, false).await;
+    assert!(!client.needs_initial_full_sync.is_armed());
+
+    let mut second = Wire::default();
+    log_in(&client).await;
+    serve_until(&client, &frames, &mut second, Wire::decided).await;
+    assert_eq!(
+        (second.app_state.len(), second.presences),
+        (0, 1),
+        "the next connection announces the session and syncs nothing"
+    );
+
+    client
+        .shutdown()
+        .await
+        .device
+        .expect("the shutdown saves the device");
+    let (rebuilt, rebuilt_frames) = client_over(&backend).await;
+    assert!(!rebuilt.needs_initial_full_sync.is_armed());
+    let mut wire = Wire::default();
+    log_in(&rebuilt).await;
+    serve_until(&rebuilt, &rebuilt_frames, &mut wire, Wire::decided).await;
+    assert_eq!(
+        (wire.app_state.len(), wire.presences),
+        (0, 1),
+        "nor does a client built after it"
+    );
+}
+
+/// The client that pairs keeps the library's own semantics: pairing arms its
+/// gate past the pairing connection, which cannot settle it, the connection
+/// the 515 brings up runs the bootstrap once, and the record that owes it from
+/// the identity's own write clears with the gate.
+#[tokio::test]
+async fn pairing_client_unchanged_without_rebuild() {
+    let backend = crate::test_utils::create_test_backend().await;
+    let (client, frames) = client_over(&backend).await;
+    assert!(!client.needs_initial_full_sync.is_armed());
+    let pairing = client.sync_scope(None);
+    pair(&client).await;
+    assert!(client.needs_initial_full_sync.is_armed());
+    // Saved as a host saves at pair-success.
+    client
+        .persistence_manager
+        .flush()
+        .await
+        .expect("the device saves");
+    let stored = stored_device(&backend).await;
+    assert!(stored.pn.is_some(), "the stored record holds the identity");
+    assert!(
+        stored.initial_full_sync_owed,
+        "and, written with it, the bootstrap it owes"
+    );
+
+    client.settle_bootstrap(pairing, false).await;
+    assert!(
+        client.needs_initial_full_sync.is_armed(),
+        "the pairing connection cannot answer for the bootstrap pairing asked for"
+    );
+    assert!(
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .initial_full_sync_owed,
+        "and a settle that does not take leaves the record alone"
+    );
+
+    let mut first = Wire::default();
+    log_in(&client).await;
+    serve_until(&client, &frames, &mut first, |wire| {
+        wire.app_state.len() == 2
+    })
+    .await;
+    assert_eq!(first.app_state, bootstrap_syncs());
+    assert_eq!(first.presences, 0);
+    stored_owed_reaches(&backend, false).await;
+    assert!(!client.needs_initial_full_sync.is_armed());
+
+    let mut second = Wire::default();
+    log_in(&client).await;
+    serve_until(&client, &frames, &mut second, Wire::decided).await;
+    assert_eq!(
+        (second.app_state.len(), second.presences),
+        (0, 1),
+        "the bootstrap ran once"
+    );
+}
+
+/// A client built while the bootstrap is still owed, over a store that already
+/// holds the app-state key (an earlier client received the primary's share and
+/// stopped before the bootstrap completed), starts the critical sync at once.
+/// The primary doesn't share the key again, so the key-share grace would only
+/// hold the session back for its whole length.
+#[tokio::test(start_paused = true)]
+async fn bootstrap_owed_with_a_stored_key_skips_the_key_share_grace() {
+    let backend = crate::test_utils::create_test_backend().await;
+    pair_and_close(&backend).await;
+    backend
+        .set_sync_key(
+            KEY_ID,
+            AppStateSyncKey {
+                key_data: MASTER_KEY.to_vec(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the test store takes a key");
+
+    let (client, frames) = client_over(&backend).await;
+    assert!(client.needs_initial_full_sync.is_armed());
+    let mut wire = Wire::default();
+    let logged_in = tokio::time::Instant::now();
+    log_in_without_key_share(&client).await;
+    serve_until(&client, &frames, &mut wire, Wire::decided).await;
+    assert_eq!(
+        wire.app_state,
+        bootstrap_syncs()[..1],
+        "the first login syncs the critical collections"
+    );
+    // The paused clock moves only once every task waits on a timer, so a
+    // client that sat the grace out would have moved it by the whole grace.
+    assert!(
+        logged_in.elapsed() < Duration::from_secs(node_io::KEY_SHARE_GRACE_SECS),
+        "without waiting out the key-share grace"
+    );
 }

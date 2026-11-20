@@ -1,0 +1,1 @@
+ALTER TABLE device ADD COLUMN initial_full_sync_owed BOOLEAN NOT NULL DEFAULT 0;

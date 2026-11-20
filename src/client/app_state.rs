@@ -193,8 +193,9 @@ fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
 pub(crate) struct BootstrapGate(AtomicU64);
 
 impl BootstrapGate {
-    /// Armed by pairing before any connection exists, so generation zero owns
-    /// the first write and every later connection outranks it.
+    /// Armed before any connection exists, by a device record that still owes
+    /// the bootstrap, so generation zero owns the first write and every later
+    /// connection outranks it.
     pub(crate) fn new(outstanding: bool) -> Self {
         Self(AtomicU64::new(BootstrapState::new(outstanding).word()))
     }
@@ -1201,14 +1202,16 @@ impl Client {
         }
     }
 
-    /// Record whether the initial bootstrap still has work outstanding.
+    /// Record whether the initial bootstrap still has work outstanding: in the
+    /// gate, then in the device record, so a client built over the device after
+    /// this one starts where this one left off.
     ///
     /// The gate is shared across connections, so a task from a retired one must
     /// not touch it: clearing would let the live connection skip a bootstrap it
     /// still needs, and arming would cost it one it does not. Routing every
     /// write through here is what keeps that check from being the caller's job —
     /// it was forgotten twice when it was.
-    pub(crate) fn settle_bootstrap(&self, scope: SyncScope, outstanding: bool) {
+    pub(crate) async fn settle_bootstrap(&self, scope: SyncScope, outstanding: bool) {
         // Two guards, closing two different holes, which is why neither alone
         // was enough on the previous attempts.
         //
@@ -1243,6 +1246,40 @@ impl Client {
             warn!(target: "Client/AppState", "Initial App State Sync incomplete; bootstrap stays armed");
         } else {
             debug!(target: "Client/AppState", "Initial App State Sync completed.");
+        }
+        self.record_bootstrap_owed().await;
+    }
+
+    /// Write the gate's state to the device record's `initial_full_sync_owed`,
+    /// and save the record at once if that changed it.
+    ///
+    /// The gate is read inside the device write, not passed in. Two
+    /// connections' settles can reach the gate in one order and the device in
+    /// the other, and a value carried over from the gate write would then leave
+    /// the record on the older answer; read under the device lock, whichever
+    /// write lands last sees the gate as the last settle left it. Saved here
+    /// rather than left to the background saver, which a host need not run. A
+    /// failed save stays dirty and goes out with the next flush, saver tick or
+    /// the shutdown flush, so a later settle that leaves the value unchanged
+    /// need not save it again. A crash before the save lands costs at most one
+    /// more bootstrap for the debt pairing records, which the record has held
+    /// since the identity was written.
+    async fn record_bootstrap_owed(&self) {
+        let gate = &self.needs_initial_full_sync;
+        let changed = self
+            .persistence_manager
+            .modify_device(|device| {
+                let owed = gate.is_armed();
+                let changed = device.initial_full_sync_owed != owed;
+                device.initial_full_sync_owed = owed;
+                changed
+            })
+            .await;
+        if changed && let Err(e) = self.persistence_manager.flush().await {
+            warn!(
+                target: "Client/AppState",
+                "Failed to save the bootstrap's state to the device record: {e}"
+            );
         }
     }
 
@@ -1282,7 +1319,7 @@ impl Client {
         // the bootstrap still owes the non-critical collections, and the background
         // sync that fetches them is what stands the gate down.
         if plan.outstanding() {
-            self.settle_bootstrap(scope, true);
+            self.settle_bootstrap(scope, true).await;
         }
         if !self.scope_is_current(scope) {
             return false;
@@ -1598,7 +1635,7 @@ impl Client {
                         pending = outcome.retryable;
                         if let RetryProgress::Complete { bootstrap_outstanding } = progress {
                             if let Some(outstanding) = bootstrap_outstanding {
-                                client.settle_bootstrap(scope, outstanding);
+                                client.settle_bootstrap(scope, outstanding).await;
                             }
                             return;
                         }
@@ -7906,7 +7943,7 @@ mod sync_scope_tests {
             client
                 .needs_initial_full_sync
                 .settle(client.connection_generation.load(Ordering::SeqCst), armed);
-            client.settle_bootstrap(retired, !armed);
+            client.settle_bootstrap(retired, !armed).await;
             assert_eq!(
                 client.needs_initial_full_sync.is_armed(),
                 armed,
@@ -7916,9 +7953,9 @@ mod sync_scope_tests {
 
         // The live connection still owns it, both ways.
         let live = client.sync_scope(None);
-        client.settle_bootstrap(live, true);
+        client.settle_bootstrap(live, true).await;
         assert!(client.needs_initial_full_sync.is_armed());
-        client.settle_bootstrap(live, false);
+        client.settle_bootstrap(live, false).await;
         assert!(!client.needs_initial_full_sync.is_armed());
     }
 
@@ -7932,7 +7969,7 @@ mod sync_scope_tests {
             .needs_initial_full_sync
             .settle(expired.generation(), false);
 
-        client.settle_bootstrap(expired, true);
+        client.settle_bootstrap(expired, true).await;
         assert!(
             client.needs_initial_full_sync.is_armed(),
             "an expired bootstrap is unfinished, and must say so"

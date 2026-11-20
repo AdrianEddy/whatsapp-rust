@@ -11,6 +11,10 @@ use wacore::stanza::wire_tags::StanzaTag;
 /// backlog-bound, so this is generous.
 pub(crate) const MESSAGE_LIVE_PERMITS: usize = 64;
 
+/// How long the critical bootstrap waits for the primary's auto-shared app
+/// state key when none has landed yet (`run_initial_app_state_sync`).
+pub(super) const KEY_SHARE_GRACE_SECS: u64 = 10;
+
 /// What `with_stanza_permit_suspended` reports back to the suspended stanza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermitSuspension {
@@ -2178,9 +2182,24 @@ impl Client {
         // auto-shared, the batched sync below falls back to an explicit
         // AppStateSyncKeyRequest bounded by `critical_deadline`, so correctness
         // does not depend on this grace.
-        const KEY_SHARE_GRACE_SECS: u64 = 10;
+        //
+        // The flag only knows this process. A key already in the store is the
+        // share this grace waits for, landed in an earlier process (a restart
+        // while the bootstrap is still owed, or while the push name is still
+        // empty), and the primary does not send it again, so waiting would
+        // only hold `Connected` back for the whole grace. A store error waits
+        // as before. A key left by an earlier link also skips the wait; the
+        // sync then asks for the key it lacks, one redundant request.
         let key_share_listener = self.initial_keys_synced_notifier.listen();
-        if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
+        if !self.initial_app_state_keys_received.load(Ordering::Relaxed)
+            && !matches!(
+                self.persistence_manager
+                    .backend_ref()
+                    .get_latest_sync_key_id()
+                    .await,
+                Ok(Some(_))
+            )
+        {
             debug!(
                 target: "Client/AppState",
                 "Waiting up to {KEY_SHARE_GRACE_SECS}s for the auto-shared app state key..."
@@ -2316,7 +2335,7 @@ impl Client {
         // unarmed, which is the failure this path exists to prevent.
         // `settle_bootstrap` is what makes the "only for this
         // connection" part impossible to forget.
-        self.settle_bootstrap(scope, !complete);
+        self.settle_bootstrap(scope, !complete).await;
 
         // A refused critical collection is not in `requested` and
         // never will be retried, but it is why the bootstrap is

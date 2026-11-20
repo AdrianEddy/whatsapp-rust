@@ -2312,6 +2312,10 @@ pub struct Client {
     /// network I/O — so it cannot become the kind of wait that parks a caller
     /// behind an unresponsive socket.
     pub(crate) connection_publish: Mutex<()>,
+    /// Whether the initial app-state bootstrap is owed. Built armed when the
+    /// device record still owes one (`initial_full_sync_owed`), armed by
+    /// pairing, and settled only through [`Client::settle_bootstrap`], which
+    /// writes the outcome back to the record.
     pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
     /// Built on first app-state use and never replaced: reconnect clears the
