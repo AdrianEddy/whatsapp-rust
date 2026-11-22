@@ -522,6 +522,81 @@ fn delete_app_state_mutation_macs(
     Ok(())
 }
 
+fn delete_app_state_version(
+    conn: &mut SqliteConnection,
+    name: &str,
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    diesel::delete(
+        app_state_versions::table
+            .filter(app_state_versions::name.eq(name))
+            .filter(app_state_versions::device_id.eq(device_id)),
+    )
+    .execute(conn)?;
+    Ok(())
+}
+
+fn clear_app_state_mutation_macs(
+    conn: &mut SqliteConnection,
+    name: &str,
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    diesel::delete(
+        app_state_mutation_macs::table
+            .filter(app_state_mutation_macs::name.eq(name))
+            .filter(app_state_mutation_macs::device_id.eq(device_id)),
+    )
+    .execute(conn)?;
+    Ok(())
+}
+
+/// One applied patch: the version, the MACs it removed, then the ones it added.
+fn write_app_state_patch(
+    conn: &mut SqliteConnection,
+    name: &str,
+    data: &[u8],
+    version: u64,
+    removed_index_macs: &[Vec<u8>],
+    added: &[AppStateMutationMAC],
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    upsert_app_state_version(conn, name, data, device_id)?;
+    delete_app_state_mutation_macs(conn, name, removed_index_macs, device_id)?;
+    insert_app_state_mutation_macs(conn, name, version, added, device_id)
+}
+
+/// The collection's base as `get_version` answers it, read inside the
+/// caller's transaction: a record that does not decode is no record there, so
+/// it is none here too.
+fn stored_app_state_base(
+    conn: &mut SqliteConnection,
+    name: &str,
+    device_id: i32,
+) -> std::result::Result<Option<CollectionBase>, DieselError> {
+    let data: Option<Vec<u8>> = app_state_versions::table
+        .select(app_state_versions::state_data)
+        .filter(app_state_versions::name.eq(name))
+        .filter(app_state_versions::device_id.eq(device_id))
+        .first(conn)
+        .optional()?;
+    Ok(data
+        .and_then(|data| crate::wire::decode_hash_state(&data).ok())
+        .as_ref()
+        .map(CollectionBase::from))
+}
+
+/// What a collection replacement writes to the version row, the record
+/// encoded once for every retry.
+#[derive(Clone)]
+enum VersionRow {
+    /// Nothing: the row stays as the comparison found it.
+    Keep,
+    /// The encoded record.
+    Upsert(Arc<Vec<u8>>),
+    /// The row deleted.
+    Delete,
+}
+
 /// Eight bound columns per row keep this below SQLite's default 999-parameter
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
@@ -2694,13 +2769,7 @@ impl SqliteStore {
         self.with_retry("delete_app_state_version", || {
             let name = name.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::delete(
-                    app_state_versions::table
-                        .filter(app_state_versions::name.eq(&name))
-                        .filter(app_state_versions::device_id.eq(device_id)),
-                )
-                .execute(conn)?;
-                Ok(())
+                delete_app_state_version(conn, &name, device_id)
             })
         })
         .await
@@ -2806,9 +2875,101 @@ impl SqliteStore {
             let added = Arc::clone(&added);
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
-                    upsert_app_state_version(conn, &name, &data, device_id)?;
-                    delete_app_state_mutation_macs(conn, &name, &removed, device_id)?;
-                    insert_app_state_mutation_macs(conn, &name, version, &added, device_id)
+                    write_app_state_patch(conn, &name, &data, version, &removed, &added, device_id)
+                })
+            })
+        })
+        .await
+    }
+
+    /// [`Self::commit_app_state_patch_for_device`] behind the comparison of
+    /// the stored base (version and ltHash) with `base`, read in the same
+    /// immediate transaction, so the write lock is held from the read to the
+    /// commit. The rows are shared by every retry as they were handed over,
+    /// with no copy.
+    async fn commit_app_state_patch_if_for_device(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        state: &HashState,
+        removed_index_macs: Vec<Vec<u8>>,
+        added: Vec<AppStateMutationMAC>,
+        device_id: i32,
+    ) -> Result<CollectionWrite> {
+        let name = name.to_string();
+        let version = state.version;
+        let data = Arc::new(crate::wire::encode_hash_state(state));
+        let removed = Arc::new(removed_index_macs);
+        let added = Arc::new(added);
+        self.with_retry("commit_app_state_patch_if", || {
+            let name = name.clone();
+            let data = Arc::clone(&data);
+            let removed = Arc::clone(&removed);
+            let added = Arc::clone(&added);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| {
+                    let stored = stored_app_state_base(conn, &name, device_id)?;
+                    if stored != base {
+                        return Ok(CollectionWrite::Conflict { stored });
+                    }
+                    write_app_state_patch(
+                        conn, &name, &data, version, &removed, &added, device_id,
+                    )?;
+                    Ok(CollectionWrite::Applied)
+                })
+            })
+        })
+        .await
+    }
+
+    /// The collection's MAC rows replaced, and its record as `record` says,
+    /// behind the comparison of the stored base (version and ltHash) with
+    /// `base`, in one immediate transaction (one WAL commit), where a snapshot
+    /// used to be a clear, a put and a version write, each its own commit.
+    /// `Keep` makes no statement on the version row, so it cannot roll back
+    /// a flag another writer set on the same base. The rows are shared by
+    /// every retry as they were handed over, with no copy of a snapshot's MAC
+    /// set at its memory peak.
+    async fn replace_app_state_collection_for_device(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        record: CollectionRecord,
+        macs: Vec<AppStateMutationMAC>,
+        device_id: i32,
+    ) -> Result<CollectionWrite> {
+        let name = name.to_string();
+        // The rows carry the record's version: the stored one, which the
+        // comparison found to be the base, when it is kept, and 0 without one.
+        let (version, row) = match record {
+            CollectionRecord::Keep => (base.map_or(0, |base| base.version), VersionRow::Keep),
+            CollectionRecord::Set(state) => (
+                state.version,
+                VersionRow::Upsert(Arc::new(crate::wire::encode_hash_state(&state))),
+            ),
+            CollectionRecord::Remove => (0, VersionRow::Delete),
+        };
+        let macs = Arc::new(macs);
+        self.with_retry("replace_app_state_collection", || {
+            let name = name.clone();
+            let row = row.clone();
+            let macs = Arc::clone(&macs);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| {
+                    let stored = stored_app_state_base(conn, &name, device_id)?;
+                    if stored != base {
+                        return Ok(CollectionWrite::Conflict { stored });
+                    }
+                    clear_app_state_mutation_macs(conn, &name, device_id)?;
+                    insert_app_state_mutation_macs(conn, &name, version, &macs, device_id)?;
+                    match &row {
+                        VersionRow::Keep => {}
+                        VersionRow::Upsert(data) => {
+                            upsert_app_state_version(conn, &name, data, device_id)?
+                        }
+                        VersionRow::Delete => delete_app_state_version(conn, &name, device_id)?,
+                    }
+                    Ok(CollectionWrite::Applied)
                 })
             })
         })
@@ -3566,22 +3727,46 @@ impl AppSyncStore for SqliteStore {
         .await
     }
 
+    async fn commit_patch_if(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        state: HashState,
+        removed_index_macs: Vec<Vec<u8>>,
+        added: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        self.commit_app_state_patch_if_for_device(
+            name,
+            base,
+            &state,
+            removed_index_macs,
+            added,
+            self.device_id,
+        )
+        .await
+    }
+
     async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
         let device_id = self.device_id;
         let name = name.to_string();
         self.with_retry("clear_mutation_macs", || {
             let name = name.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::delete(
-                    app_state_mutation_macs::table
-                        .filter(app_state_mutation_macs::name.eq(&name))
-                        .filter(app_state_mutation_macs::device_id.eq(device_id)),
-                )
-                .execute(conn)?;
-                Ok(())
+                clear_app_state_mutation_macs(conn, &name, device_id)
             })
         })
         .await
+    }
+
+    async fn replace_collection(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        record: CollectionRecord,
+        macs: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        self.replace_app_state_collection_for_device(name, base, record, macs, self.device_id)
+            .await
     }
 
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {

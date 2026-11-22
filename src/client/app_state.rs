@@ -18,6 +18,7 @@ use std::borrow::Cow;
 use wacore::appstate_sync::{
     AppStateBatch, AppStateMutationPersistence, MetadataValidatedPatchList, Provenance,
 };
+use wacore::store::traits::{CollectionBase, CollectionRecord, CollectionWrite};
 
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
@@ -935,8 +936,9 @@ impl Client {
         }
     }
 
-    /// Sync one collection, retrying a missing decode key and a locked DB, and
-    /// handing whatever that leaves unsettled to the task retry scheduler.
+    /// Sync one collection, retrying a missing decode key, a locked DB and a
+    /// write the store refused because another writer moved the collection,
+    /// and handing whatever that leaves unsettled to the task retry scheduler.
     ///
     /// Takes no in-flight reservation of its own: the only caller is the patch
     /// send, which already holds the collection's reservation for the whole
@@ -953,6 +955,8 @@ impl Client {
     ) -> Result<SyncOutcome> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
+        // Its own flag, so a key retry on the first attempt doesn't use it up.
+        let mut conflict_retried = false;
         let outcome = loop {
             attempt += 1;
             // full_sync=false lets process_app_state_sync_task auto-detect:
@@ -997,6 +1001,26 @@ impl Client {
                         }
                         continue;
                     }
+                    // The store refused a write because another writer moved
+                    // the collection after this sync read it: that writer has
+                    // committed, so syncing again from what the store now holds
+                    // is the whole repair, with nothing to wait for. Once, so a
+                    // writer that keeps moving the collection is left to the
+                    // scheduler's backoff. In-process it is this sync that
+                    // loses, to a retired connection's write still in flight.
+                    let conflict = e
+                        .downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                        .is_some_and(|ase| {
+                            matches!(
+                                ase,
+                                crate::appstate_sync::AppStateSyncError::VersionConflict { .. }
+                            )
+                        });
+                    if conflict && !conflict_retried {
+                        conflict_retried = true;
+                        info!(target: "Client/AppState", "{name:?} moved under its sync ({e}); syncing it again from the stored version");
+                        continue;
+                    }
                     let is_db_locked = e
                         .downcast_ref::<wacore::store::error::StoreError>()
                         .is_some_and(|se| se.is_database_busy_or_locked())
@@ -1013,7 +1037,7 @@ impl Client {
                         self.runtime.sleep(backoff).await;
                         continue;
                     }
-                    wacore::telemetry::appstate_sync("fail");
+                    wacore::telemetry::appstate_sync(if conflict { "conflict" } else { "fail" });
                     break Err(e);
                 }
             }
@@ -1723,56 +1747,74 @@ impl Client {
     /// on the path the first sync already takes, instead of teaching the
     /// snapshot rules a second shape to recognise.
     ///
-    /// The version goes first. Either write can be the last one a cancelled or
-    /// failed rebuild completes, and of the two halves it can stop at, `v0` with
-    /// stale MACs is the recoverable one: `process_patch_list` clears them
-    /// itself before applying anything to an empty baseline. The other order
-    /// leaves the collection claiming a version whose MACs are gone, which
-    /// nothing downstream is looking for.
+    /// The record and the MAC rows go together, in one
+    /// [`replace_collection`](wacore::store::traits::AppSyncStore::replace_collection)
+    /// that removes the record and leaves no rows, so a cancelled or failed
+    /// rebuild leaves the collection whole or never-synced, never a version
+    /// whose MACs are gone.
     ///
-    /// Callers hold the collection's reservation across this, so no other writer
-    /// can observe the half-stood-down state while the rebuild runs — while the
-    /// scope holds. A reconnect clears the reservation registry out from under
-    /// live tasks, so the scope is re-asked before each write, and a rebuild
-    /// that has lost it leaves the collection exactly as it was rather than half
-    /// reset.
-    ///
-    /// Those checks narrow the window; they do not close it. A connection that
-    /// retires while one of these writes is in flight is not seen, so the write
-    /// still lands — the same shape as the apply itself, whose three writes sit
-    /// behind one admission check in
-    /// [`sync_collections_batched_inner`](Self::sync_collections_batched_inner).
-    /// What remains is bounded by how long a local store write takes, against a
-    /// replacement connection that would have to handshake, reserve and apply
-    /// inside it. Closing it properly means a store that refuses writes from a
-    /// retired generation, which is the same change the apply wants and does not
-    /// belong to one caller.
+    /// Callers hold the collection's reservation across this, but a reconnect
+    /// clears the reservation registry out from under live tasks, so the scope
+    /// is asked before the write, and a rebuild that has lost it leaves the
+    /// collection exactly as it was. The write is also conditioned on the
+    /// record just read (its version and ltHash), which a store that overrides
+    /// [`replace_collection`](wacore::store::traits::AppSyncStore::replace_collection)
+    /// compares as it writes, and the trait's default just before it writes: a
+    /// connection that retires while the write is in flight, and whose
+    /// replacement has moved the collection before that comparison, makes it a
+    /// conflict instead of wiping what the replacement wrote. A conflict under
+    /// a scope that still holds means a writer the reservation did not exclude
+    /// (an apply its own connection outlived) moved the collection after the
+    /// read, and the rebuild is still wanted, so the collection is stood down
+    /// from the record the store now holds, which the conflict reports.
     async fn stand_collection_down(
         &self,
         backend: &dyn wacore::store::traits::Backend,
         name: WAPatchName,
         scope: SyncScope,
     ) -> Result<StandDown> {
-        let Some(state) = backend.get_version(name.as_str()).await? else {
-            return Ok(StandDown::Done);
-        };
-        if let Err(lost) = self.admits(scope) {
-            return Ok(StandDown::Declined(lost));
+        let mut base = backend
+            .get_version(name.as_str())
+            .await?
+            .as_ref()
+            .map(CollectionBase::from);
+        while let Some(found) = base {
+            if let Err(lost) = self.admits(scope) {
+                return Ok(StandDown::Declined(lost));
+            }
+            let version = found.version;
+            debug!(
+                target: "Client/AppState",
+                "Batched sync: standing {name:?} down from v{version} to rebuild it"
+            );
+            match backend
+                .replace_collection(
+                    name.as_str(),
+                    Some(found),
+                    CollectionRecord::Remove,
+                    Vec::new(),
+                )
+                .await?
+            {
+                CollectionWrite::Applied => break,
+                CollectionWrite::Conflict { stored } => {
+                    // The found record as the conflict's error names one: two
+                    // equal versions were told apart by their ltHash.
+                    info!(
+                        target: "Client/AppState",
+                        "Batched sync: {name:?} moved from v{version} to {} before its stand-down",
+                        match stored {
+                            Some(stored) if stored.version == version => {
+                                format!("v{version} with another ltHash")
+                            }
+                            Some(stored) => format!("v{}", stored.version),
+                            None => "no record".to_owned(),
+                        }
+                    );
+                    base = stored;
+                }
+            }
         }
-        debug!(
-            target: "Client/AppState",
-            "Batched sync: standing {name:?} down from v{} to rebuild it",
-            state.version
-        );
-        backend.delete_version(name.as_str()).await?;
-        if let Err(lost) = self.admits(scope) {
-            // The version is already down, and that half is the recoverable one:
-            // the next sync sees an unsynced collection and rebuilds it, clearing
-            // the MACs on the way. Stopping here is still better than writing on,
-            // because by now another generation may own the collection.
-            return Ok(StandDown::Declined(lost));
-        }
-        backend.clear_mutation_macs(name.as_str()).await?;
         Ok(StandDown::Done)
     }
 
@@ -3428,11 +3470,16 @@ impl Client {
 
     /// Write a collection the primary sent back, and announce what changed.
     ///
-    /// Lives here rather than beside the peer-message plumbing because the write
-    /// is app-state's: it takes the same reservation a sync and a patch send
-    /// take, since it is a clear, a put and a set over the very rows they write,
-    /// and interleaving with either can leave the persisted ltHash and the MAC
-    /// store describing different states.
+    /// Lives here rather than beside the peer-message plumbing because the
+    /// write is app-state's: it takes the same reservation a sync and a patch
+    /// send take, since it replaces the very rows they write, in one
+    /// [`replace_collection`](wacore::store::traits::AppSyncStore::replace_collection)
+    /// conditioned on the record the apply read. Without the reservation either
+    /// could move the collection between that read and the write: a store that
+    /// overrides that method would then refuse the recovery, and the trait's
+    /// default, a clear, a put and a set in separate calls after its
+    /// comparison, can leave the persisted ltHash and the MAC store describing
+    /// different states.
     ///
     /// The caller is already detached from the inbound path, so this waits for
     /// the reservation on its own time.
@@ -3593,12 +3640,15 @@ impl Client {
 
         // The generation check above is true only until the next await. Beneath
         // this call are a store lookup per key, a whole collection's worth of
-        // HMACs, and then the three writes that replace the collection -- and a
+        // HMACs, and then the write that replaces the collection -- and a
         // disconnect anywhere in there drops the registry wholesale, so the
         // reservation held here stops excluding the new connection's own sync
         // from the very rows about to be written. So the apply asks again, on
         // the far side of that work: before the records' effects, the first
-        // write, and once more in front of the collection's own rows.
+        // write, and once more in front of the collection's own rows, which
+        // the store then writes only over the record the apply read (as of its
+        // comparison: inside the write in a store that overrides
+        // `replace_collection`, just before it in the trait's default).
         let still_current = self.generation_fence(generation);
         // The recovery's own version, read above before
         // `apply_snapshot_recovery` moves `recovery`: it is the post-apply
@@ -3653,6 +3703,22 @@ impl Client {
                     target: "Client/AppState",
                     "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
                 );
+            }
+            // Another writer moved the collection after the recovery read it,
+            // and the store wrote nothing of the recovery. What that writer left
+            // is the collection now; whether the primary's copy still has
+            // anything to add is for its next sync to find, as when the
+            // connection goes before the write.
+            Ok(wacore::appstate_sync::RecoveryOutcome::Conflict { stored }) => {
+                info!(
+                    target: "Client/AppState",
+                    "Discarding the primary's {name} at v{recovery_version}: the collection moved to {} under the write; syncing it instead",
+                    stored.map_or_else(
+                        || "no record".to_owned(),
+                        |stored| format!("v{}", stored.version)
+                    )
+                );
+                self.converge_after_dropped_recovery_weak(patch_name);
             }
             Err(e) => {
                 // The ask is released all the same, by the caller. One request

@@ -163,11 +163,15 @@ impl Client {
     ///
     /// Bound it with a timeout if a caller must, but bound the *wait*, not the
     /// whole call: dropping the future once a response is being applied cancels
-    /// it between the writes that replace a collection's baseline — the mutation
-    /// MACs and the version are separate commits — and leaves the collection
-    /// needing another sync to agree with itself again. Nothing is lost that a
-    /// later sync cannot rebuild, and no other writer can interleave while this
-    /// one holds the reservation, but a cancelled apply is not a clean stop.
+    /// it part-way (after a rebuild's stand-down and before the snapshot that
+    /// replaces the collection, say, or after some of a list's patches), and
+    /// leaves the collection for a later sync to finish. Each write that
+    /// replaces a collection's baseline is one
+    /// [`replace_collection`](wacore::store::traits::AppSyncStore::replace_collection),
+    /// so in a store that overrides it, as the bundled stores do, the mutation
+    /// MACs and the version move together. Nothing is lost that a later sync
+    /// cannot rebuild, and no other writer can interleave while this one holds
+    /// the reservation, but a cancelled apply is not a clean stop.
     ///
     /// It also does not retry: what a run left unsynced comes back in the
     /// report, and *when* to ask again is the caller's decision. Re-asking in a

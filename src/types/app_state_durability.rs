@@ -64,7 +64,21 @@ pub use wacore::appstate_sync::{AppStateBatch, AppStateBatchKind};
 /// collection, so each call must commit on its own. Once such a call returns,
 /// the old connection's sync stops without writing the collection's rows or
 /// dispatching the batch, and the collection's next sync offers its mutations
-/// again.
+/// again. The same holds when any other writer moves the collection while a
+/// call runs and leaves it on another version or ltHash than the batch was
+/// built on, or without a record (a rebuild back to the same version with
+/// another ltHash does too), except that the next sync offers the mutations
+/// again only if they still apply: the store compares the collection's version
+/// and ltHash with those the batch was built on, and refuses the batch's rows.
+/// A store that overrides
+/// [`AppSyncStore`](wacore::store::traits::AppSyncStore)'s two conditional
+/// writes, as the bundled stores do, compares inside the write; the trait's
+/// defaults compare just before it, so a writer landing in between goes unseen.
+/// In both cases what the call committed stays committed, and it can land after
+/// a newer batch of the collection: apply each mutation only over older state
+/// of its index, and remember each index a REMOVE removed, with the batch's
+/// `version` (a REMOVE need not carry a timestamp), so that a late SET does not
+/// bring it back.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait AppStateDurabilityHook: wacore::sync_marker::MaybeSendSync {

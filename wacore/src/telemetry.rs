@@ -119,7 +119,9 @@ mod imp {
     pub fn connect(outcome: &'static str) {
         counter!("wa_connect_total", "outcome" => outcome).increment(1);
     }
-    /// App-state collection sync completed, by outcome (`ok`/`fail`).
+    /// App-state collection sync completed, by outcome: `ok`, `deferred` (left
+    /// to a later connection), `conflict` (another writer moved the collection
+    /// under the sync, and again under its immediate re-sync) or `fail`.
     pub fn appstate_sync(outcome: &'static str) {
         counter!("wa_appstate_sync_total", "outcome" => outcome).increment(1);
     }

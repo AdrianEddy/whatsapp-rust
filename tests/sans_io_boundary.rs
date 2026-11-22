@@ -154,6 +154,7 @@ impl Boundary {
             "crate::appstate::patch_decode::CollectionSyncError",
             "crate::appstate::hash::HashState",
             "crate::appstate::keys::ExpandedAppStateKeys",
+            "crate::appstate::processor::AppStateMutationMAC",
             "crate::appstate::processor::PatchProcessingResult",
             "crate::appstate::processor::ProcessedSnapshot",
             "crate::appstate::AppStateError",

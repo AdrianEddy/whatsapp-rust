@@ -17,7 +17,7 @@ use crate::appstate::keys::ExpandedAppStateKeys;
 use crate::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
 use crate::appstate::processor::AppStateMutationMAC;
 use crate::appstate::{collect_key_id_refs_from_patch_list, expand_app_state_keys};
-use crate::store::traits::Backend;
+use crate::store::traits::{Backend, CollectionBase, CollectionRecord, CollectionWrite};
 use waproto::whatsapp as wa;
 
 // Re-export Mutation from appstate for convenience
@@ -133,20 +133,25 @@ pub trait AppStateMutationPersistence: crate::sync_marker::MaybeSendSync {
     /// Called once for each patch that carries a mutation and for every
     /// snapshot and snapshot recovery, an empty one included (it says the
     /// collection is empty), after the two effects above and before the
-    /// processor commits any of the batch's rows: before `commit_patch` for a
-    /// patch, before the MAC rewrite and `set_version` for a snapshot or a
-    /// recovery. (A collection starting over without a baseline has already
-    /// had the stale MAC rows of a reset cleared before its genesis patch.)
-    /// [`AppStateBatch`] says what the batch is, the version it brings the
-    /// collection to and the provenance its events carry.
+    /// processor commits any of the batch's rows: before
+    /// [`commit_patch_if`](crate::store::traits::AppSyncStore::commit_patch_if)
+    /// for a patch, before
+    /// [`replace_collection`](crate::store::traits::AppSyncStore::replace_collection)
+    /// for a snapshot or a recovery. (A collection starting over without a
+    /// baseline has already had the stale MAC rows of a reset cleared before
+    /// its genesis patch.) [`AppStateBatch`] says what the batch is, the version
+    /// it brings the collection to and the provenance its events carry.
     ///
     /// An error leaves the collection's rows as this call found them, so the
     /// same mutations are offered again by a later sync, and a crash between
     /// this call and the commit offers them again too: implementations must be
     /// idempotent. So does a caller that retires while this runs (see
-    /// [`StillCurrentFn`]): the processor then writes none of the batch's rows,
-    /// and the collection's next sync offers it again. The error is returned
-    /// to the caller as it is. The default persists nothing.
+    /// [`StillCurrentFn`]), or another writer moving the collection meanwhile,
+    /// before the store's comparison ([`AppStateSyncError::VersionConflict`],
+    /// or for a recovery [`RecoveryOutcome::Conflict`]): the processor then
+    /// writes none of the batch's rows, and the collection's next sync offers
+    /// it again if it still applies. The error is returned to the caller as it
+    /// is. The default persists nothing.
     async fn persist_mutations(&self, _batch: AppStateBatch<'_>) -> Result<()> {
         Ok(())
     }
@@ -348,6 +353,23 @@ struct PatchListProgress {
     state: HashState,
     committed_state: HashState,
     new_mutations: Vec<Mutation>,
+    /// Whether the store held a record for the collection as this apply last
+    /// read or wrote it, its closing write aside. `committed_state` is that
+    /// record when it did (a default stands in for none), so the two give the
+    /// base each write is conditioned on ([`Self::base`]) without a second copy
+    /// of it here. The closing write, when the apply makes one (a stale
+    /// snapshot's flag, or the record a quiet collection's bootstrap leaves),
+    /// updates neither: the apply returns after it.
+    recorded: bool,
+}
+
+impl PatchListProgress {
+    /// The collection as this apply last read or wrote it, its closing write
+    /// aside (`None` for no record): the base of its next write.
+    fn base(&self) -> Option<CollectionBase> {
+        self.recorded
+            .then(|| CollectionBase::from(&self.committed_state))
+    }
 }
 
 /// What one call fixes for the whole of a list's apply, read by both phases.
@@ -530,6 +552,62 @@ pub enum AppStateSyncError {
     /// fetch, on whichever connection replaced this one.
     #[error("app-state apply retired before writing the collection")]
     Retired,
+    /// The store refused the collection's next write because it no longer
+    /// held the record the apply built on ([`CollectionWrite::Conflict`]: its
+    /// version and ltHash, the [`CollectionBase`]): another writer moved the
+    /// collection after the apply read it, so nothing was written. What the
+    /// list committed before comes back through [`CommittedMutationsError`],
+    /// and the collection's next sync starts from what the store holds. (A
+    /// recovery the store refuses is [`RecoveryOutcome::Conflict`] instead.)
+    ///
+    /// `base` and `stored` are the two records' versions (`None` is no
+    /// record). Equal versions mean the same version with another ltHash: a
+    /// rebuild that landed back on the version the apply read, typically over
+    /// a local copy that had diverged.
+    #[error(
+        "app-state collection changed under the apply: built on {}, stored {}{}",
+        version_label(.base),
+        version_label(.stored),
+        hash_label(.base, .stored)
+    )]
+    VersionConflict {
+        base: Option<u64>,
+        stored: Option<u64>,
+    },
+}
+
+/// A collection's stored version in an error message.
+fn version_label(version: &Option<u64>) -> String {
+    match version {
+        Some(version) => format!("v{version}"),
+        None => "no record".to_owned(),
+    }
+}
+
+/// What a conflict's versions leave unsaid: two equal ones were told apart
+/// by their ltHash.
+fn hash_label(base: &Option<u64>, stored: &Option<u64>) -> &'static str {
+    if base == stored {
+        " with another ltHash"
+    } else {
+        ""
+    }
+}
+
+/// A conditional collection write's result as the apply's: a store error as
+/// it is, and a conflict as [`AppStateSyncError::VersionConflict`] over `base`.
+fn written(
+    write: crate::store::error::Result<CollectionWrite>,
+    base: Option<CollectionBase>,
+) -> Result<()> {
+    match write? {
+        CollectionWrite::Applied => Ok(()),
+        CollectionWrite::Conflict { stored } => Err(AppStateSyncError::VersionConflict {
+            base: base.map(|base| base.version),
+            stored: stored.map(|stored| stored.version),
+        }
+        .into()),
+    }
 }
 
 /// One outstanding ask, and the id the answer will carry back.
@@ -568,6 +646,12 @@ pub enum RecoveryOutcome {
     /// written, so its rows were not touched. The records' effects were
     /// persisted only if it stopped while they were being written.
     Retired,
+    /// Another writer moved the collection after the version check, so the
+    /// store refused the write ([`CollectionWrite::Conflict`]): none of the
+    /// collection's rows or its record were touched. The records' effects
+    /// were persisted, and repeat harmlessly. `stored` is the record the store
+    /// found, `None` for none.
+    Conflict { stored: Option<CollectionBase> },
 }
 
 /// Which ask, if any, a recovery reply answers.
@@ -1019,6 +1103,14 @@ impl AppStateProcessor {
     /// made before calling are therefore stale by exactly the store lookups and
     /// the record work in between, which is the part of this that can take
     /// real time, and the effects await the device store and the host's commit.
+    /// The collection's rows are then one
+    /// [`replace_collection`](crate::store::traits::AppSyncStore::replace_collection)
+    /// conditioned on the record this read first (its version and ltHash),
+    /// which a store overriding that method compares inside the write, and the
+    /// trait's default just before it: a writer that moved the collection after
+    /// that read and before the comparison, unseen by the fence, makes it
+    /// [`RecoveryOutcome::Conflict`], with nothing written; the store's own
+    /// errors are returned as they are.
     pub async fn apply_snapshot_recovery(
         &self,
         recovery: wa::SyncdSnapshotRecovery,
@@ -1055,12 +1147,17 @@ impl AppStateProcessor {
         // also the whole guard against regression: the caller applies a reply
         // from the primary whether or not anything still remembers asking for
         // it, so a burst of late answers is settled here, one version at a time.
-        let held = self
+        // The write below is conditioned on this very read (`base`), so a
+        // collection that moves after it is not rolled back either (with the
+        // trait's default, unless it moves between that default's comparison
+        // and its writes).
+        let base = self
             .backend
             .get_version(name)
             .await?
-            .map(|state| state.version)
-            .unwrap_or(0);
+            .as_ref()
+            .map(CollectionBase::from);
+        let held = base.map_or(0, |base| base.version);
         if snapshot_is_stale(held, version) {
             return Ok(RecoveryOutcome::Stale {
                 held,
@@ -1255,31 +1352,33 @@ impl AppStateProcessor {
             return Ok(RecoveryOutcome::Retired);
         }
 
-        // Same order the snapshot path commits in, and for the same reason: the
-        // version goes last, so a store error part-way leaves a collection that
-        // will be recovered again rather than one whose version says it is
-        // current over MACs that are gone.
-        self.backend.clear_mutation_macs(name).await?;
-        if !macs.is_empty() {
-            self.backend.put_mutation_macs(name, version, &macs).await?;
+        // The collection whole, as the snapshot path writes it: its MAC rows
+        // and the recovered version in one operation, and only over the record
+        // read above (a store that overrides `replace_collection` does both;
+        // the trait's default compares, then writes in separate calls). A
+        // writer that moved the collection before the store's comparison (a
+        // sync on the connection that replaced the caller's, typically) is not
+        // rolled back: the store refuses with a conflict, which the outcome
+        // reports as it reports `Stale` and `Retired`, and the collection's
+        // next sync starts from what that writer left.
+        let state = HashState {
+            version,
+            hash,
+            bootstrapped: true,
+            // The snapshot that could not be validated is the reason we
+            // are here; the collection the primary just handed over is
+            // not in that state.
+            mac_mismatch_fatal: false,
+            ..Default::default()
+        };
+        match self
+            .backend
+            .replace_collection(name, base, CollectionRecord::Set(state), macs)
+            .await?
+        {
+            CollectionWrite::Applied => Ok(RecoveryOutcome::Applied(mutations)),
+            CollectionWrite::Conflict { stored } => Ok(RecoveryOutcome::Conflict { stored }),
         }
-        self.backend
-            .set_version(
-                name,
-                HashState {
-                    version,
-                    hash,
-                    bootstrapped: true,
-                    // The snapshot that could not be validated is the reason we
-                    // are here; the collection the primary just handed over is
-                    // not in that state.
-                    mac_mismatch_fatal: false,
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        Ok(RecoveryOutcome::Applied(mutations))
     }
 
     /// Drop every cached key, so the next access re-expands from the backend.
@@ -1612,11 +1711,12 @@ impl AppStateProcessor {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
-        let state = self
-            .backend
-            .get_version(pl.name.as_str())
-            .await?
-            .unwrap_or_default();
+        let stored = self.backend.get_version(pl.name.as_str()).await?;
+        // The base of the list's first write: every write below is conditioned
+        // on the store still holding what this apply last read or wrote, its
+        // version and ltHash ([`PatchListProgress::base`]).
+        let recorded = stored.is_some();
+        let state = stored.unwrap_or_default();
         // The caller's fence, asked once the collection is read and before
         // anything is written. The writes below that no batch precedes -- the
         // genesis clear, and the version a list without patches records --
@@ -1629,6 +1729,7 @@ impl AppStateProcessor {
             committed_state: state.clone(),
             state,
             new_mutations: Vec::new(),
+            recorded,
         });
         let collection = pl.name;
         let collection_name = pl.name.as_str();
@@ -1694,10 +1795,26 @@ impl AppStateProcessor {
             // wipe them before the genesis patch runs, or its ltHash would be anchored
             // to stale index->value entries (REMOVE/overwrite lookups would subtract
             // MACs that aren't part of this fresh baseline). The snapshot branch above
-            // already clears for the snapshot path.
-            if let Err(error) = self.backend.clear_mutation_macs(collection_name).await {
+            // already clears for the snapshot path. The record is left exactly as
+            // read (`Keep`: none for none, and no write of it, so a quiet, empty
+            // collection's sync writes nothing), and the clear is conditioned on
+            // it like every write here, so a sync that moved the collection
+            // before the store's comparison keeps its rows.
+            let cleared = written(
+                self.backend
+                    .replace_collection(
+                        collection_name,
+                        progress.base(),
+                        CollectionRecord::Keep,
+                        Vec::new(),
+                    )
+                    .await,
+                // A conflict wrote nothing, so the base is still what it was built on.
+                progress.base(),
+            );
+            if let Err(error) = cleared {
                 return Err(committed_mutations_error(
-                    error.into(),
+                    error,
                     progress.new_mutations,
                     &progress.committed_state,
                     collection,
@@ -1731,20 +1848,33 @@ impl AppStateProcessor {
         }
         pl.patches = processed_patches;
 
-        // Handle case where we only have a snapshot and no patches
+        // Handle case where we only have a snapshot and no patches. A snapshot
+        // applied above has written its version with the flag its last page
+        // sets, so only a stale one, which wrote nothing, can leave the flag to
+        // record here, on the record the store holds.
         if pl.patches.is_empty() && pl.snapshot.is_some() {
-            progress.state.bootstrapped |= !pl.has_more_patches;
-            if let Err(error) = self
-                .backend
-                .set_version(collection_name, progress.state.clone())
-                .await
-            {
-                return Err(committed_mutations_error(
-                    error.into(),
-                    progress.new_mutations,
-                    &progress.committed_state,
-                    collection,
-                ));
+            if !progress.state.bootstrapped && !pl.has_more_patches {
+                progress.state.bootstrapped = true;
+                let committed = written(
+                    self.backend
+                        .commit_patch_if(
+                            collection_name,
+                            progress.base(),
+                            progress.state.clone(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await,
+                    progress.base(),
+                );
+                if let Err(error) = committed {
+                    return Err(committed_mutations_error(
+                        error,
+                        progress.new_mutations,
+                        &progress.committed_state,
+                        collection,
+                    ));
+                }
             }
         } else if pl.patches.is_empty()
             && !pl.has_more_patches
@@ -1778,10 +1908,22 @@ impl AppStateProcessor {
             //
             // A collection already marked is skipped: every sync of a quiet one
             // ends here, and has nothing to record.
+            //
+            // The MAC rows stay as they are (cleared above for an empty
+            // baseline), so this is a patch of no rows, on the record read.
             progress.state.bootstrapped = true;
-            self.backend
-                .set_version(collection_name, progress.state.clone())
-                .await?;
+            written(
+                self.backend
+                    .commit_patch_if(
+                        collection_name,
+                        progress.base(),
+                        progress.state.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await,
+                progress.base(),
+            )?;
         }
 
         Ok((progress.new_mutations, progress.state, pl))
@@ -1933,27 +2075,29 @@ impl AppStateProcessor {
             return Err(AppStateSyncError::Retired.into());
         }
 
-        // A snapshot is a fresh baseline, so wipe the collection's prior mutation
-        // MACs first, even when the snapshot has none. Leftover
-        // index->value entries would corrupt the next patch's ltHash.
-        //
-        // Commit the version LAST. If clear/put fails on a transient store error,
-        // an already-advanced version would make the retry treat this same snapshot
-        // as stale (snapshot_is_stale) and skip it, stranding the old MACs forever.
-        self.backend.clear_mutation_macs(collection_name).await?;
-        if !snapshot_result.mutation_macs.is_empty() {
-            self.backend
-                .put_mutation_macs(
-                    collection_name,
-                    progress.state.version,
-                    &snapshot_result.mutation_macs,
-                )
-                .await?;
-        }
+        // A snapshot is a fresh baseline, so the collection's prior mutation
+        // MACs go, even when the snapshot has none: leftover index->value
+        // entries would corrupt the next patch's ltHash. The rows and the
+        // version are one write, conditioned on the record this apply read (its
+        // version and ltHash), so in a store that overrides
+        // `replace_collection` neither a failure part-way (new rows under the
+        // old version) nor a writer that moved the collection since (rolled
+        // back to this snapshot) can leave the two disagreeing; the trait's
+        // default compares, then writes in separate calls. The MAC set moves to
+        // the store: it is the collection's whole size, at the memory peak.
         progress.state.bootstrapped |= !pl.has_more_patches;
-        self.backend
-            .set_version(collection_name, progress.state.clone())
-            .await?;
+        written(
+            self.backend
+                .replace_collection(
+                    collection_name,
+                    progress.base(),
+                    CollectionRecord::Set(progress.state.clone()),
+                    snapshot_result.mutation_macs,
+                )
+                .await,
+            // A conflict wrote nothing, so the base is still what it was built on.
+            progress.base(),
+        )?;
         // Snapshot owns the whole collection: move its Vec into the empty
         // accumulator rather than extend, which would allocate + copy a second
         // collection-sized buffer at the memory peak. is_empty falls back to extend.
@@ -1962,7 +2106,9 @@ impl AppStateProcessor {
         } else {
             progress.new_mutations.extend(snapshot_result.mutations);
         }
+        // The record just written, the base of the list's next write.
         progress.committed_state = progress.state.clone();
+        progress.recorded = true;
         Ok(())
     }
 
@@ -2029,14 +2175,31 @@ impl AppStateProcessor {
         {
             return Err(AppStateSyncError::Retired.into());
         }
-        self.backend
-            .commit_patch(
-                collection_name,
-                prepared.result().state.clone(),
-                &prepared.result().removed_index_macs,
-                &prepared.result().added_macs,
-            )
-            .await?;
+        // Conditioned on the record the patch was folded over (its version and
+        // ltHash): a writer the fence cannot see (one that moved the collection
+        // after it was asked, a rebuild back to this very version with another
+        // ltHash included) makes the store refuse when it lands before the
+        // store's comparison (inside the write, in a store that overrides
+        // `commit_patch_if`), and nothing of this patch is written. The rows
+        // move to the store; publication needs only the state and the
+        // mutations.
+        let (removed_index_macs, added_macs) = prepared.take_rows();
+        written(
+            self.backend
+                .commit_patch_if(
+                    collection_name,
+                    progress.base(),
+                    prepared.result().state.clone(),
+                    removed_index_macs,
+                    added_macs,
+                )
+                .await,
+            // A conflict wrote nothing, so the base is still what it was built on.
+            progress.base(),
+        )?;
+        // Publication makes the state just written `committed_state`, the base
+        // of the list's next write.
+        progress.recorded = true;
         Ok(preparation::publish_patch(
             prepared,
             &mut progress.state,
@@ -2415,6 +2578,7 @@ mod future_layout_tests {
             state: HashState::default(),
             committed_state: HashState::default(),
             new_mutations: Vec::new(),
+            recorded: false,
         };
         let options = ApplyOptions {
             validate_macs: true,

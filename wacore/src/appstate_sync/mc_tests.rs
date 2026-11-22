@@ -2,6 +2,10 @@
 //! `AppStateMutationPersistence::persist_mutations` before the collection's
 //! cursor moves, and a refusal leaves the cursor where it was; a caller that
 //! retires before or during the batch's effects has none of its rows written.
+//! WF14 at the end: on each path, a write the store refuses because another
+//! writer moved the collection while the batch's commit was held leaves that
+//! writer's state, and fails with the retryable conflict (a recovery answers
+//! `RecoveryOutcome::Conflict`).
 //!
 //! The persistence below reads the store when it is called, so each test sees
 //! what had been committed at that moment: neither the cursor nor the batch's
@@ -1140,6 +1144,193 @@ async fn appstate_recovery_retired_during_the_hook_writes_no_rows() {
     assert_eq!((stored.version, stored.hash), (held.version, held.hash));
     assert_eq!(
         (fixture.macs(&records).await, fixture.macs(&[&stale]).await),
+        (0, 1)
+    );
+}
+
+// WF14: the collection's writes are conditioned on the record the apply read
+// (its version and ltHash), and the store compares it as it writes. A writer
+// the caller's fence can't see (it still answers that the caller is current, as
+// for a retirement that lands after the fence's last ask, or for another client
+// over the same store) moves the collection while the host holds the commit:
+// the store refuses the held write, so the newer state stays, nothing of the
+// held batch is written, and the error is the retryable conflict, never a
+// recovery; a recovery reports the conflict as its outcome.
+
+fn is_conflict(error: &anyhow::Error, base: Option<u64>, stored: Option<u64>) -> bool {
+    matches!(
+        error.downcast_ref::<AppStateSyncError>(),
+        Some(AppStateSyncError::VersionConflict { base: b, stored: s }) if *b == base && *s == stored
+    )
+}
+
+/// A conflict asks the primary for nothing: the collection is retried as any
+/// failed sync is.
+fn asks_no_recovery(error: &anyhow::Error) -> bool {
+    crate::sync_engine::app_state::RecoveryRequest::for_error(COLLECTION, error.downcast_ref())
+        == crate::sync_engine::app_state::RecoveryRequest::NotNeeded
+}
+
+/// The patch path: v11 commits, v12 is held while another writer commits v13;
+/// the store refuses v12 and the list returns v11 for dispatch.
+#[tokio::test]
+async fn appstate_patch_over_a_moved_collection_writes_nothing() {
+    let fixture = setup().await;
+    fixture.seed(held_state(10)).await;
+    let committed = archive(FIRST_CHAT, true, 1_000);
+    let held = archive(SECOND_CHAT, true, 1_001);
+    let newer = archive(THIRD_CHAT, true, 1_002);
+
+    let (entered, release) = fixture.recorder.park_at(1);
+    let still_current = fixture.recorder.fence();
+    let prepared = fixture
+        .prepared(list(
+            None,
+            vec![patch(11, &[&committed]), patch(12, &[&held])],
+        ))
+        .await;
+    let apply = fixture.processor.process_prepared_patch_list(
+        prepared,
+        false,
+        Provenance::Live,
+        &still_current,
+    );
+    let other_writer = async {
+        entered.await.expect("the hook parks");
+        fixture.newer_connection_commits(13, &newer).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let (applied, ()) = futures::join!(apply, other_writer);
+
+    let (mutations, state, collection, source) = applied
+        .expect_err("a refused write fails the list")
+        .downcast::<CommittedMutationsError>()
+        .expect("v11 was committed before the other write")
+        .into_parts();
+    assert_eq!(returned_indexes(&mutations), indexes(&[&committed]));
+    assert_eq!((state.version, collection), (11, COLLECTION));
+    assert!(is_conflict(&source, Some(11), Some(13)), "{source:#}");
+    assert!(asks_no_recovery(&source));
+    let stored = fixture.stored().await.expect("the newer cursor stays");
+    assert_eq!((stored.version, stored.hash), (13, NEWER_HASH));
+    assert_eq!(
+        (
+            fixture.macs(&[&committed]).await,
+            fixture.macs(&[&held]).await,
+            fixture.macs(&[&newer]).await
+        ),
+        (1, 0, 1)
+    );
+    // The fence held at every ask, after the hook too: the store refused.
+    assert_eq!(
+        fixture.recorder.take_calls(),
+        vec![
+            asked(true),
+            asked(true),
+            batch(Patch, 11, &[&committed], false, Some(10)),
+            asked(true),
+            asked(true),
+            batch(Patch, 12, &[&held], false, Some(11)),
+            asked(true),
+        ]
+    );
+}
+
+/// The snapshot path: the snapshot of a collection with no record is held
+/// while another writer commits v6; the store refuses the snapshot's rows and
+/// its version together.
+#[tokio::test]
+async fn appstate_snapshot_over_a_moved_collection_writes_nothing() {
+    let fixture = setup().await;
+    let first = archive(FIRST_CHAT, true, 1_000);
+    let second = archive(SECOND_CHAT, true, 1_001);
+    let newer = archive(THIRD_CHAT, true, 1_002);
+
+    let (entered, release) = fixture.recorder.park_at(0);
+    let still_current = fixture.recorder.fence();
+    let prepared = fixture
+        .prepared(list(Some(snapshot(5, &[&first, &second])), Vec::new()))
+        .await;
+    let apply = fixture.processor.process_prepared_patch_list(
+        prepared,
+        false,
+        Provenance::FullSync,
+        &still_current,
+    );
+    let other_writer = async {
+        entered.await.expect("the hook parks");
+        fixture.newer_connection_commits(6, &newer).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let (applied, ()) = futures::join!(apply, other_writer);
+
+    let error = applied.expect_err("a refused write fails the list");
+    assert!(
+        error.downcast_ref::<CommittedMutationsError>().is_none(),
+        "nothing was committed before the snapshot"
+    );
+    assert!(is_conflict(&error, None, Some(6)), "{error:#}");
+    assert!(asks_no_recovery(&error));
+    let stored = fixture.stored().await.expect("the newer cursor stays");
+    assert_eq!((stored.version, stored.hash), (6, NEWER_HASH));
+    assert_eq!(
+        (
+            fixture.macs(&[&first, &second]).await,
+            fixture.macs(&[&newer]).await
+        ),
+        (0, 1)
+    );
+    assert_eq!(
+        fixture.recorder.take_calls(),
+        vec![
+            asked(true),
+            asked(true),
+            batch(Snapshot, 5, &[&first, &second], true, None),
+            asked(true),
+        ]
+    );
+}
+
+/// The recovery path: the recovery of v3 to v9 is held while another writer
+/// commits v4; the store refuses the recovery, which doesn't roll the
+/// collection back to the version it read.
+#[tokio::test]
+async fn appstate_recovery_over_a_moved_collection_writes_nothing() {
+    let fixture = setup().await;
+    fixture.seed(held_state(3)).await;
+    let recovered = archive(FIRST_CHAT, true, 1_000);
+    let newer = archive(THIRD_CHAT, true, 1_002);
+
+    let (entered, release) = fixture.recorder.park_at(0);
+    let still_current = fixture.recorder.fence();
+    let apply = fixture.processor.apply_snapshot_recovery(
+        recovery(9, &[&recovered]),
+        COLLECTION.as_str(),
+        &still_current,
+    );
+    let other_writer = async {
+        entered.await.expect("the hook parks");
+        fixture.newer_connection_commits(4, &newer).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let (applied, ()) = futures::join!(apply, other_writer);
+
+    let outcome = applied.expect("a refused recovery is an outcome, not an error");
+    let RecoveryOutcome::Conflict { stored } = outcome else {
+        panic!("the store refuses the recovery: {outcome:?}");
+    };
+    assert_eq!(
+        stored,
+        Some(CollectionBase::from(&newer_state(4))),
+        "the conflict reports the record the other writer left"
+    );
+    let stored = fixture.stored().await.expect("the newer cursor stays");
+    assert_eq!((stored.version, stored.hash), (4, NEWER_HASH));
+    assert_eq!(
+        (
+            fixture.macs(&[&recovered]).await,
+            fixture.macs(&[&newer]).await
+        ),
         (0, 1)
     );
 }

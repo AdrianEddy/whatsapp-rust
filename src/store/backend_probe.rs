@@ -128,7 +128,9 @@ macro_rules! forward_domains {
                 fn get_mutation_macs<'s, 'a, 'b>(this: &'s Self, name: &'a str, index_macs: &'b [[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>>;
                 fn delete_mutation_macs<'s, 'a, 'b>(this: &'s Self, name: &'a str, index_macs: &'b [Vec<u8>]) -> Result<()>;
                 fn commit_patch<'s, 'a, 'b, 'c>(this: &'s Self, name: &'a str, state: HashState, removed_index_macs: &'b [Vec<u8>], added: &'c [AppStateMutationMAC]) -> Result<()>;
+                fn commit_patch_if<'s, 'a>(this: &'s Self, name: &'a str, base: Option<CollectionBase>, state: HashState, removed_index_macs: Vec<Vec<u8>>, added: Vec<AppStateMutationMAC>) -> Result<CollectionWrite>;
                 fn clear_mutation_macs<'s, 'a>(this: &'s Self, name: &'a str) -> Result<()>;
+                fn replace_collection<'s, 'a>(this: &'s Self, name: &'a str, base: Option<CollectionBase>, record: CollectionRecord, macs: Vec<AppStateMutationMAC>) -> Result<CollectionWrite>;
                 fn get_latest_sync_key_id<'s>(this: &'s Self) -> Result<Option<Vec<u8>>>;
             }
         }

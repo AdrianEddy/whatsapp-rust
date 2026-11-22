@@ -3,7 +3,7 @@
 use super::IndexMac;
 use crate::appstate::hash::HashState;
 use crate::appstate::keys::ExpandedAppStateKeys;
-use crate::appstate::processor::{PatchProcessingResult, ProcessedSnapshot};
+use crate::appstate::processor::{AppStateMutationMAC, PatchProcessingResult, ProcessedSnapshot};
 use crate::appstate::{AppStateError, Mutation, process_patch, process_snapshot};
 use std::{collections::HashMap, sync::Arc};
 use waproto::whatsapp as wa;
@@ -32,6 +32,16 @@ impl PreparedPatch {
 
     pub fn result(&self) -> &PatchProcessingResult {
         &self.result
+    }
+
+    /// The MAC rows the patch removes and adds, moved out for the store's
+    /// commit: publication reads only the state and the mutations, so the
+    /// rows go to the store without a copy.
+    pub(super) fn take_rows(&mut self) -> (Vec<Vec<u8>>, Vec<AppStateMutationMAC>) {
+        (
+            std::mem::take(&mut self.result.removed_index_macs),
+            std::mem::take(&mut self.result.added_macs),
+        )
     }
     pub fn into_parts(self) -> (wa::SyncdPatch, PatchProcessingResult) {
         (self.patch, self.result)

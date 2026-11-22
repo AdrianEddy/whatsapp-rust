@@ -3216,4 +3216,7 @@ mod tests {
             "a collection already marked has nothing to record"
         );
     }
+
+    // WF14's twins of the tests above (`appstate_sync/tests/mc_tests.rs`).
+    mod mc_tests;
 }

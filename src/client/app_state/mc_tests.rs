@@ -18,6 +18,15 @@
 //! after the one that paired it runs that bootstrap, once, and the pairing
 //! client itself behaves as before. Over a store that already holds the
 //! app-state key, that client starts it without waiting for a key share.
+//!
+//! WF14 after it: a patch or a snapshot whose commit the host holds while
+//! another writer moves the collection writes nothing over that writer's
+//! version, whether a reconnect or a writer the connection can't see moved it,
+//! and the collection's next sync goes on from there. The snapshot comes as the
+//! server sends one, an encrypted blob behind a reference, from a media host.
+//! The re-sync after a send whose commit is refused that way syncs again at
+//! once, and a recovery from the primary refused that way is converged by a
+//! sync.
 
 use super::*;
 use crate::client::ClientBuilder;
@@ -169,11 +178,15 @@ impl Host {
 
     /// Whether `chat`'s archive index has a MAC row in the collection.
     async fn has_mac(&self, chat: &str) -> bool {
+        self.mac(chat).await.is_some()
+    }
+
+    /// The value MAC of `chat`'s archive index in the collection, if any.
+    async fn mac(&self, chat: &str) -> Option<Vec<u8>> {
         self.backend
             .get_mutation_mac(COLLECTION.as_str(), &mac_row(chat).index_mac)
             .await
             .expect("the test store reads")
-            .is_some()
     }
 }
 
@@ -228,6 +241,14 @@ impl EventHandler for Host {
 /// A client built with the host's hook, connected over the capturing
 /// transport and wired as `test_utils::create_iq_test_client` wires its own.
 async fn client_for(host: &Arc<Host>) -> (Arc<Client>, Arc<CapturingMockTransport>, Subscription) {
+    client_with(host, Arc::new(crate::test_utils::MockHttpClient)).await
+}
+
+/// [`client_for`], with `http` serving the client's downloads.
+async fn client_with(
+    host: &Arc<Host>,
+    http: Arc<dyn crate::http::HttpClient>,
+) -> (Arc<Client>, Arc<CapturingMockTransport>, Subscription) {
     let persistence = Arc::new(
         PersistenceManager::new(host.backend.clone())
             .await
@@ -239,7 +260,7 @@ async fn client_for(host: &Arc<Host>) -> (Arc<Client>, Arc<CapturingMockTranspor
         .with_runtime(crate::runtime_impl::TokioRuntime)
         .with_persistence_manager(persistence)
         .with_transport_factory_arc(Arc::new(factory))
-        .with_http_client(crate::test_utils::MockHttpClient)
+        .with_http_client_arc(http)
         .with_app_state_durability_hook_arc(host.clone())
         .build()
         .await
@@ -321,43 +342,47 @@ struct Server {
     state: HashState,
 }
 
+/// `chat`'s archive as the primary encrypts it: its index MAC, and the value
+/// with its content MAC.
+fn archive_record(chat: &str, timestamp: i64) -> wa::SyncdRecord {
+    let keys = expand_app_state_keys(&MASTER_KEY);
+    let index = archive_index(chat);
+    let plaintext = waproto::codec::sync_action_data_to_vec(&index, &archive_value(timestamp), 0);
+    let mut blob = vec![0u8; 16];
+    let mut ciphertext = Vec::new();
+    aes_256_cbc_encrypt_into(&plaintext, &keys.value_encryption, &blob, &mut ciphertext)
+        .expect("AES-CBC takes a 32-byte key and a 16-byte IV");
+    blob.extend_from_slice(&ciphertext);
+    let value_mac = generate_content_mac(
+        wa::syncd_mutation::SyncdOperation::SET,
+        &blob,
+        KEY_ID,
+        &keys.value_mac,
+    );
+    blob.extend_from_slice(&value_mac);
+
+    let mut record = wa::SyncdRecord::default();
+    record.index = buffa::MessageField::some({
+        let mut proto = wa::SyncdIndex::default();
+        proto.blob = Some(generate_index_mac(&index, &keys.index));
+        proto
+    });
+    record.value = buffa::MessageField::some({
+        let mut proto = wa::SyncdValue::default();
+        proto.blob = Some(blob);
+        proto
+    });
+    record.key_id = key_id();
+    record
+}
+
 impl Server {
     /// The next patch: one archive of `chat`, an index the collection lacks.
     fn patch(&mut self, chat: &str, timestamp: i64) -> wa::SyncdPatch {
         let keys = expand_app_state_keys(&MASTER_KEY);
-        let index = archive_index(chat);
-        let plaintext =
-            waproto::codec::sync_action_data_to_vec(&index, &archive_value(timestamp), 0);
-        let mut blob = vec![0u8; 16];
-        let mut ciphertext = Vec::new();
-        aes_256_cbc_encrypt_into(&plaintext, &keys.value_encryption, &blob, &mut ciphertext)
-            .expect("AES-CBC takes a 32-byte key and a 16-byte IV");
-        blob.extend_from_slice(&ciphertext);
-        let value_mac = generate_content_mac(
-            wa::syncd_mutation::SyncdOperation::SET,
-            &blob,
-            KEY_ID,
-            &keys.value_mac,
-        );
-        blob.extend_from_slice(&value_mac);
-
         let mut mutation = wa::SyncdMutation::default();
         mutation.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
-        mutation.record = buffa::MessageField::some({
-            let mut record = wa::SyncdRecord::default();
-            record.index = buffa::MessageField::some({
-                let mut proto = wa::SyncdIndex::default();
-                proto.blob = Some(generate_index_mac(&index, &keys.index));
-                proto
-            });
-            record.value = buffa::MessageField::some({
-                let mut proto = wa::SyncdValue::default();
-                proto.blob = Some(blob);
-                proto
-            });
-            record.key_id = key_id();
-            record
-        });
+        mutation.record = buffa::MessageField::some(archive_record(chat, timestamp));
 
         let mutations = vec![mutation];
         let (_, folded) = self.state.update_hash(&mutations, |_, _| Ok(None));
@@ -379,6 +404,82 @@ impl Server {
         ));
         patch
     }
+
+    /// The collection rebuilt as a snapshot at `at` holding `chats`' archives,
+    /// signed as the server signs it; the server's collection is that from now
+    /// on.
+    fn snapshot(&mut self, at: u64, chats: &[&str]) -> wa::SyncdSnapshot {
+        let keys = expand_app_state_keys(&MASTER_KEY);
+        let records: Vec<_> = chats
+            .iter()
+            .zip(1_000..)
+            .map(|(chat, timestamp)| archive_record(chat, timestamp))
+            .collect();
+        self.state = HashState {
+            version: at,
+            ..Default::default()
+        };
+        let folded = self.state.update_hash_from_records(&records);
+        assert_eq!(folded.folded, records.len(), "every record folds");
+        let mut snapshot = wa::SyncdSnapshot::default();
+        snapshot.version = version(at);
+        snapshot.records = records;
+        snapshot.key_id = key_id();
+        snapshot.mac = Some(
+            self.state
+                .generate_snapshot_mac(COLLECTION.as_str(), &keys.snapshot_mac),
+        );
+        snapshot
+    }
+}
+
+/// `snapshot` as the server hands it out, an encrypted media blob: the
+/// reference a `<snapshot>` node carries, and the blob behind it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures encode their protos directly"
+)]
+fn snapshot_blob(snapshot: &wa::SyncdSnapshot) -> (Vec<u8>, Vec<u8>) {
+    let plaintext = buffa::Message::encode_to_vec(snapshot);
+    let encrypted = wacore::upload::encrypt_media(&plaintext, crate::download::MediaType::AppState)
+        .expect("a snapshot encrypts");
+    let mut reference = wa::ExternalBlobReference::default();
+    reference.direct_path = Some("/wf14-snapshot".into());
+    reference.media_key = Some(encrypted.media_key.to_vec());
+    reference.file_sha256 = Some(encrypted.file_sha256.to_vec());
+    reference.file_enc_sha256 = Some(encrypted.file_enc_sha256.to_vec());
+    reference.file_size_bytes = Some(plaintext.len() as u64);
+    (
+        buffa::Message::encode_to_vec(&reference),
+        encrypted.data_to_upload,
+    )
+}
+
+/// Serves one blob for every download, as a media host holding a snapshot.
+struct BlobHost(Vec<u8>);
+
+#[async_trait::async_trait]
+impl crate::http::HttpClient for BlobHost {
+    async fn execute(
+        &self,
+        _request: crate::http::HttpRequest,
+    ) -> Result<crate::http::HttpResponse> {
+        Ok(crate::http::HttpResponse::new(200, self.0.clone()))
+    }
+}
+
+/// A media route, so a download goes to the client's HTTP client without
+/// asking the server for one first.
+async fn media_route(client: &Client) {
+    *client.media_conn.write().await = Some(crate::mediaconn::MediaConn {
+        auth: "wf14".into(),
+        ttl: 3600,
+        auth_ttl: None,
+        hosts: vec![crate::mediaconn::MediaConnHost::new(
+            "cdn.example.com".into(),
+        )],
+        fetched_at: wacore::time::Instant::now(),
+    });
 }
 
 fn patches(patches: &[wa::SyncdPatch]) -> Node {
@@ -411,6 +512,22 @@ fn page(has_more: bool, served: Vec<wa::SyncdPatch>) -> Answer {
                 .attr("name", COLLECTION.as_str())
                 .attr("has_more_patches", if has_more { "true" } else { "false" })
                 .children([patches(&served)])
+                .build(),
+        )
+    })
+}
+
+/// The collection rebuilt from a snapshot, its blob behind `reference`.
+fn snapshot_page(reference: Vec<u8>) -> Answer {
+    Box::new(move |request_id| {
+        iq_result(
+            request_id,
+            NodeBuilder::new("collection")
+                .attr("name", COLLECTION.as_str())
+                .attr("has_more_patches", "false")
+                .children([NodeBuilder::new("snapshot")
+                    .bytes(reference.clone())
+                    .build()])
                 .build(),
         )
     })
@@ -724,6 +841,32 @@ async fn app_state_hook_refusal_after_a_send_is_retried_with_backoff() {
     assert_eq!(host.version(COLLECTION).await, Some(8));
 }
 
+/// `collection` as the primary phone sends it back at `at`, holding `chats`'
+/// archives.
+fn recovery(collection: WAPatchName, at: u64, chats: &[&str]) -> wa::SyncdSnapshotRecovery {
+    let mut recovery = wa::SyncdSnapshotRecovery::default();
+    recovery.version = version(at);
+    recovery.collection_name = Some(collection.as_str().to_string());
+    recovery.collection_lthash = Some(vec![0x5A; 128]);
+    recovery.mutation_records = chats
+        .iter()
+        .zip(1_000..)
+        .map(|(chat, timestamp)| {
+            let mut record = wa::SyncdPlainTextRecord::default();
+            record.value = buffa::MessageField::some({
+                let mut data = wa::SyncActionData::default();
+                data.index = Some(archive_index(chat));
+                data.value = buffa::MessageField::some(archive_value(timestamp));
+                data
+            });
+            record.key_id = Some(KEY_ID.to_vec());
+            record.mac = Some(vec![0x11; 32]);
+            record
+        })
+        .collect();
+    recovery
+}
+
 /// A collection the primary phone sends back commits whole, as a full sync,
 /// before the client rewrites its MAC rows and writes the recovered cursor.
 #[tokio::test]
@@ -743,29 +886,12 @@ async fn app_state_hook_commits_a_recovery_as_a_full_sync() {
         .expect("the test store takes a version");
     let (client, _transport, _subscription) = client_for(&host).await;
 
-    let mut recovery = wa::SyncdSnapshotRecovery::default();
-    recovery.version = version(9);
-    recovery.collection_name = Some(collection.as_str().to_string());
-    recovery.collection_lthash = Some(vec![0x5A; 128]);
-    recovery.mutation_records = [FIRST_CHAT, SECOND_CHAT]
-        .iter()
-        .zip(1_000..)
-        .map(|(chat, timestamp)| {
-            let mut record = wa::SyncdPlainTextRecord::default();
-            record.value = buffa::MessageField::some({
-                let mut data = wa::SyncActionData::default();
-                data.index = Some(archive_index(chat));
-                data.value = buffa::MessageField::some(archive_value(timestamp));
-                data
-            });
-            record.key_id = Some(KEY_ID.to_vec());
-            record.mac = Some(vec![0x11; 32]);
-            record
-        })
-        .collect();
-
     client
-        .apply_recovered_collection(collection.as_str(), None, recovery)
+        .apply_recovered_collection(
+            collection.as_str(),
+            None,
+            recovery(collection, 9, &[FIRST_CHAT, SECOND_CHAT]),
+        )
         .await;
     assert_eq!(
         host.take(),
@@ -1348,4 +1474,480 @@ async fn bootstrap_owed_with_a_stored_key_skips_the_key_share_grace() {
         logged_in.elapsed() < Duration::from_secs(node_io::KEY_SHARE_GRACE_SECS),
         "without waiting out the key-share grace"
     );
+}
+
+// WF14: a commit the host holds while the collection moves under it, by the
+// stage's scenario: the hook parks on a signal; the generation moves on (for a
+// reconnect); another writer commits a newer version; the hook is released.
+// Either way the held sync writes nothing over the newer version, announces
+// nothing and fails retryably, and the collection's next sync goes on from the
+// newer version.
+
+const FOURTH_CHAT: &str = "120363000000000045@g.us";
+
+/// Who moves the collection while the hook is parked.
+#[derive(Clone, Copy, Debug)]
+enum Mover {
+    /// The next connection, after a reconnect: the generation moves on and the
+    /// reservations are cleared, so the fence asked after the hook stops the
+    /// held sync before its write.
+    Reconnect,
+    /// A writer the generation can't see (another client over the same store,
+    /// or a retirement landing after the fence's last ask): the fence still
+    /// holds, and only the store's comparison refuses the held write.
+    Unseen,
+}
+
+impl Mover {
+    /// The generation (for a reconnect), then the collection: `state` with
+    /// `rows`, committed as that writer's sync would.
+    async fn moves(
+        self,
+        client: &Client,
+        host: &Host,
+        state: HashState,
+        rows: &[AppStateMutationMAC],
+    ) {
+        if let Mover::Reconnect = self {
+            client.advance_generation_for_test(1, Ordering::SeqCst);
+            client.app_state_syncing.clear();
+        }
+        host.backend
+            .commit_patch(COLLECTION.as_str(), state, &[], rows)
+            .await
+            .expect("the test store takes a patch");
+    }
+
+    /// The held sync's error: the retirement, or the store's conflict over
+    /// `base` with `stored`. Either is retryable: the collection is synced
+    /// again as any failed sync is, and the primary is asked for nothing.
+    fn failed(self, error: &anyhow::Error, base: Option<u64>, stored: u64) {
+        let found = error.downcast_ref::<AppStateSyncError>();
+        match self {
+            Mover::Reconnect => assert!(
+                matches!(found, Some(AppStateSyncError::Retired)),
+                "{error:#}"
+            ),
+            Mover::Unseen => assert!(
+                matches!(
+                    found,
+                    Some(AppStateSyncError::VersionConflict { base: b, stored: Some(s) })
+                        if *b == base && *s == stored
+                ),
+                "{error:#}"
+            ),
+        }
+        assert_eq!(
+            RecoveryRequest::for_error(COLLECTION, error.downcast_ref()),
+            RecoveryRequest::NotNeeded,
+            "{self:?}"
+        );
+    }
+}
+
+/// The patch path: v8 is held over v7 while the mover commits v9.
+async fn patch_held_while_the_collection_moves(mover: Mover) {
+    let host = Host::new().await;
+    let base = host.baseline(7).await;
+    let (client, transport, _subscription) = client_for(&host).await;
+    let mut server = Server { state: base };
+    let held = server.patch(FIRST_CHAT, 1_000);
+    server.patch(SECOND_CHAT, 1_001);
+    let moved = server.state.clone();
+    let next = server.patch(THIRD_CHAT, 1_002);
+    let rows = [mac_row(FIRST_CHAT), mac_row(SECOND_CHAT)];
+
+    let (entered, release) = host.park_next();
+    let move_it = async {
+        entered.await.expect("the hook parks");
+        mover.moves(&client, &host, moved, &rows).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let held_sync = async {
+        let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
+        futures::join!(synced, move_it).0
+    };
+    let error = serve(
+        &client,
+        &transport,
+        0,
+        vec![page(false, vec![held])],
+        held_sync,
+    )
+    .await
+    .expect_err("the held sync fails");
+
+    mover.failed(&error, Some(7), 9);
+    assert_eq!(
+        host.take(),
+        vec![commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7))],
+        "{mover:?}: the held commit, and no event"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(9), "{mover:?}");
+    assert_eq!(
+        (host.mac(FIRST_CHAT).await, host.mac(SECOND_CHAT).await),
+        (
+            Some(rows[0].value_mac.clone()),
+            Some(rows[1].value_mac.clone())
+        ),
+        "{mover:?}: the mover's rows, not the held patch's"
+    );
+
+    // The replacement connection, logged in, syncs the collection from v9.
+    reachable(&client);
+    let outcome = sync_collection(&client, &transport, 1, vec![page(false, vec![next])])
+        .await
+        .expect("the next sync applies v10");
+    assert_eq!(outcome.synced, vec![COLLECTION], "{mover:?}");
+    assert_eq!(
+        host.take(),
+        vec![
+            commit(COLLECTION, Patch, 10, &[THIRD_CHAT], false, Some(9)),
+            archived(THIRD_CHAT, false),
+        ],
+        "{mover:?}"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(10), "{mover:?}");
+}
+
+/// The snapshot path: a collection with no record bootstraps from a snapshot
+/// at v5, held while the mover commits v6.
+async fn snapshot_held_while_the_collection_moves(mover: Mover) {
+    let host = Host::new().await;
+    let mut server = Server::default();
+    let (reference, blob) = snapshot_blob(&server.snapshot(5, &[FIRST_CHAT, SECOND_CHAT]));
+    server.patch(THIRD_CHAT, 1_002);
+    let moved = server.state.clone();
+    let next = server.patch(FOURTH_CHAT, 1_003);
+    let rows = [
+        mac_row(FIRST_CHAT),
+        mac_row(SECOND_CHAT),
+        mac_row(THIRD_CHAT),
+    ];
+    let (client, transport, _subscription) = client_with(&host, Arc::new(BlobHost(blob))).await;
+    media_route(&client).await;
+
+    let (entered, release) = host.park_next();
+    let move_it = async {
+        entered.await.expect("the hook parks");
+        mover.moves(&client, &host, moved, &rows).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let held_sync = async {
+        let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
+        futures::join!(synced, move_it).0
+    };
+    let error = serve(
+        &client,
+        &transport,
+        0,
+        vec![snapshot_page(reference)],
+        held_sync,
+    )
+    .await
+    .expect_err("the held sync fails");
+
+    mover.failed(&error, None, 6);
+    assert_eq!(
+        host.take(),
+        vec![commit(
+            COLLECTION,
+            AppStateBatchKind::Snapshot,
+            5,
+            &[FIRST_CHAT, SECOND_CHAT],
+            true,
+            None
+        )],
+        "{mover:?}: the held commit, and no event"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(6), "{mover:?}");
+    assert_eq!(
+        (
+            host.mac(FIRST_CHAT).await,
+            host.mac(SECOND_CHAT).await,
+            host.mac(THIRD_CHAT).await
+        ),
+        (
+            Some(rows[0].value_mac.clone()),
+            Some(rows[1].value_mac.clone()),
+            Some(rows[2].value_mac.clone())
+        ),
+        "{mover:?}: the mover's rows, not the held snapshot's"
+    );
+
+    // The replacement connection, logged in, syncs the collection from v6.
+    reachable(&client);
+    let outcome = sync_collection(&client, &transport, 1, vec![page(false, vec![next])])
+        .await
+        .expect("the next sync applies v7");
+    assert_eq!(outcome.synced, vec![COLLECTION], "{mover:?}");
+    assert_eq!(
+        host.take(),
+        vec![
+            commit(COLLECTION, Patch, 7, &[FOURTH_CHAT], false, Some(6)),
+            archived(FOURTH_CHAT, false),
+        ],
+        "{mover:?}"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(7), "{mover:?}");
+}
+
+/// A patch held across a move of its collection writes nothing over the newer
+/// version, whichever writer moved it.
+#[tokio::test]
+async fn app_state_patch_held_while_the_collection_moves_writes_nothing() {
+    for mover in [Mover::Reconnect, Mover::Unseen] {
+        patch_held_while_the_collection_moves(mover).await;
+    }
+}
+
+/// A snapshot held across a move of its collection writes none of its rows or
+/// its version over the newer version, whichever writer moved it.
+#[tokio::test]
+async fn app_state_snapshot_held_while_the_collection_moves_writes_nothing() {
+    for mover in [Mover::Reconnect, Mover::Unseen] {
+        snapshot_held_while_the_collection_moves(mover).await;
+    }
+}
+
+/// The patch path when the collection comes back to the very version the held
+/// patch was built on, by a writer the connection can't see. The local v7 had
+/// diverged from the server's (another ltHash), so v8 is folded over the
+/// diverged copy; while it is held, the collection is stood down and rebuilt as
+/// the server holds v7, the repair a consumer's snapshot resync makes. The
+/// store compares the collection's ltHash with the version and refuses v8, so
+/// the repair stays, and the collection's next sync applies v8 over the
+/// rebuilt v7, whose ltHash its snapshot MAC now matches.
+#[tokio::test]
+async fn app_state_patch_held_across_a_rebuild_to_its_version_writes_nothing() {
+    let host = Host::new().await;
+    let mut server = Server {
+        state: HashState {
+            version: 7,
+            bootstrapped: true,
+            ..Default::default()
+        },
+    };
+    let rebuilt = server.state.clone();
+    let diverged = HashState {
+        hash: [0x5A; 128],
+        ..rebuilt.clone()
+    };
+    host.backend
+        .set_version(COLLECTION.as_str(), diverged)
+        .await
+        .expect("the test store takes a version");
+    let (client, transport, _subscription) = client_for(&host).await;
+    let held = server.patch(FIRST_CHAT, 1_000);
+
+    let (entered, release) = host.park_next();
+    let rebuild = async {
+        entered.await.expect("the hook parks");
+        host.backend
+            .delete_version(COLLECTION.as_str())
+            .await
+            .expect("the test store stands the collection down");
+        host.backend
+            .set_version(COLLECTION.as_str(), rebuilt.clone())
+            .await
+            .expect("the test store takes the rebuilt version");
+        release.send(()).expect("the hook is parked");
+    };
+    let held_sync = async {
+        let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
+        futures::join!(synced, rebuild).0
+    };
+    let error = serve(
+        &client,
+        &transport,
+        0,
+        vec![page(false, vec![held.clone()])],
+        held_sync,
+    )
+    .await
+    .expect_err("the held sync fails");
+
+    Mover::Unseen.failed(&error, Some(7), 7);
+    assert_eq!(
+        host.take(),
+        vec![commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7))],
+        "the held commit, and no event"
+    );
+    let stored = host
+        .backend
+        .get_version(COLLECTION.as_str())
+        .await
+        .expect("the test store reads")
+        .expect("the rebuilt record");
+    assert_eq!(
+        (stored.version, stored.hash, stored.mac_mismatch_fatal),
+        (7, rebuilt.hash, false),
+        "the repair stays"
+    );
+    assert!(
+        !host.has_mac(FIRST_CHAT).await,
+        "none of the held patch's rows"
+    );
+
+    // The replacement for the held sync applies v8 over the rebuilt v7.
+    reachable(&client);
+    let outcome = sync_collection(&client, &transport, 1, vec![page(false, vec![held])])
+        .await
+        .expect("the next sync applies v8");
+    assert_eq!(outcome.synced, vec![COLLECTION]);
+    assert_eq!(
+        host.take(),
+        vec![
+            commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7)),
+            archived(FIRST_CHAT, false),
+        ]
+    );
+    let stored = host
+        .backend
+        .get_version(COLLECTION.as_str())
+        .await
+        .expect("the test store reads")
+        .expect("the synced record");
+    assert_eq!(
+        (stored.version, stored.hash, stored.mac_mismatch_fatal),
+        (8, server.state.hash, false),
+        "v8 over the server's v7, its snapshot MAC matched"
+    );
+}
+
+/// The re-sync after an accepted send has its commit refused, because a writer
+/// the connection can't see moved the collection while the host held it. That
+/// writer has committed, so the re-sync syncs the collection again at once,
+/// from the version it left, within the send rather than after the retry
+/// scheduler's backoff.
+#[tokio::test]
+async fn app_state_resync_after_a_send_retries_a_conflict_at_once() {
+    let host = Host::new().await;
+    let base = host.baseline(7).await;
+    let (client, transport, _subscription) = client_for(&host).await;
+    reachable(&client);
+    let mut server = Server { state: base };
+    let echoed = server.patch(FIRST_CHAT, 1_000);
+    server.patch(SECOND_CHAT, 1_001);
+    let moved = server.state.clone();
+    let next = server.patch(THIRD_CHAT, 1_002);
+    let rows = [mac_row(FIRST_CHAT), mac_row(SECOND_CHAT)];
+
+    let (entered, release) = host.park_next();
+    let move_it = async {
+        entered.await.expect("the hook parks");
+        Mover::Unseen.moves(&client, &host, moved, &rows).await;
+        release.send(()).expect("the hook is parked");
+    };
+    let send = async {
+        let sent =
+            client.send_app_state_patch(COLLECTION.as_str(), vec![wa::SyncdMutation::default()]);
+        futures::join!(sent, move_it).0
+    };
+    serve(
+        &client,
+        &transport,
+        0,
+        // The send is accepted; its re-sync fetches v8, whose commit the mover
+        // beats to the store; the retry fetches v10 from the mover's v9.
+        vec![
+            page(false, Vec::new()),
+            page(false, vec![echoed]),
+            page(false, vec![next]),
+        ],
+        send,
+    )
+    .await
+    .expect("the send is accepted");
+
+    assert_eq!(
+        host.take(),
+        vec![
+            commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7)),
+            commit(COLLECTION, Patch, 10, &[THIRD_CHAT], false, Some(9)),
+            archived(THIRD_CHAT, false),
+        ],
+        "the refused commit announces nothing, and the retry commits v10 before its event"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(10));
+    assert_eq!(
+        host.mac(FIRST_CHAT).await,
+        Some(rows[0].value_mac.clone()),
+        "the mover's row, not the refused patch's"
+    );
+}
+
+/// A recovery from the primary whose write the store refuses, because a writer
+/// the connection can't see moved the collection while the host held the
+/// recovery's commit, writes none of its rows and announces nothing; the
+/// collection is then converged by a sync from the version that writer left.
+#[tokio::test]
+async fn app_state_recovery_refused_by_the_store_converges_by_a_sync() {
+    let host = Host::new().await;
+    let base = host.baseline(3).await;
+    let (client, transport, _subscription) = client_for(&host).await;
+    reachable(&client);
+    let mut server = Server { state: base };
+    server.patch(SECOND_CHAT, 1_001);
+    let moved = server.state.clone();
+    let next = server.patch(THIRD_CHAT, 1_002);
+    let rows = [mac_row(SECOND_CHAT)];
+    let first_frame = transport.sent().len();
+
+    let (entered, release) = host.park_next();
+    let move_it = async {
+        entered.await.expect("the hook parks");
+        Mover::Unseen.moves(&client, &host, moved, &rows).await;
+        release.send(()).expect("the hook is parked");
+    };
+    futures::join!(
+        client.apply_recovered_collection(
+            COLLECTION.as_str(),
+            None,
+            recovery(COLLECTION, 9, &[FIRST_CHAT])
+        ),
+        move_it
+    );
+
+    assert_eq!(
+        host.take(),
+        vec![commit(
+            COLLECTION,
+            AppStateBatchKind::Recovery,
+            9,
+            &[FIRST_CHAT],
+            true,
+            Some(3)
+        )],
+        "the held commit, and no event"
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(4));
+    assert_eq!(
+        (host.mac(FIRST_CHAT).await, host.mac(SECOND_CHAT).await),
+        (None, Some(rows[0].value_mac.clone())),
+        "the mover's rows, none of the recovery's"
+    );
+
+    // The refusal scheduled a sync of the collection. The clock is paused for
+    // that sync's first backoff, which then elapses once nothing else can run,
+    // and resumed after it, so the IQ helpers keep their hang guards.
+    tokio::time::pause();
+    tokio::time::sleep(APP_STATE_RETRY_BACKOFF_MIN).await;
+    tokio::time::resume();
+    serve(
+        &client,
+        &transport,
+        first_frame,
+        vec![page(false, vec![next])],
+        host.announced.notified(),
+    )
+    .await;
+    assert_eq!(
+        host.take(),
+        vec![
+            commit(COLLECTION, Patch, 5, &[THIRD_CHAT], false, Some(4)),
+            archived(THIRD_CHAT, false),
+        ]
+    );
+    assert_eq!(host.version(COLLECTION).await, Some(5));
 }

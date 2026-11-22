@@ -877,10 +877,144 @@ pub trait AppSyncStore: Send + Sync {
         added: &[AppStateMutationMAC],
     ) -> Result<()>;
 
+    /// [`commit_patch`](Self::commit_patch), on the condition that the
+    /// collection is still stored as `base`: the [`CollectionBase`] (version
+    /// and ltHash) of the record the patch was built on, as
+    /// [`get_version`](Self::get_version) answered it (`None` for no record).
+    ///
+    /// In an override, the comparison belongs to the atomic operation: read the
+    /// stored record inside the same transaction or under the same state lock
+    /// as the writes, which keep `commit_patch`'s requirements. When the stored
+    /// base is not `base` (another version, the same version with another
+    /// ltHash, a record where there was none or none where there was one),
+    /// nothing is written and the call answers [`CollectionWrite::Conflict`]
+    /// with the base found. That is an outcome, not an error: another writer
+    /// moved the collection after the apply read it (typically a sync on a
+    /// connection that replaced the caller's, or a rebuild that landed back on
+    /// the version the apply read, with the server's ltHash). Writing over it
+    /// would pair a state folded over the record the apply read with that
+    /// writer's MAC rows, and undo what the writer wrote. `Err` means what it
+    /// means for `commit_patch`.
+    ///
+    /// The rows are passed by value, so a store that keeps them past the call
+    /// (for a retry, or in its own buffers) takes them without a copy.
+    ///
+    /// The processor commits every patch through this method, and every change
+    /// of the record that leaves the MAC rows as they are (both lists empty).
+    /// The default reads the record and then calls `commit_patch`: two calls,
+    /// so a writer landing between them goes unseen. Override it with one
+    /// transaction (the bundled stores do). A backend that wraps another must
+    /// forward this method: the default runs over the wrapper's own methods, so
+    /// it bypasses the wrapped store's override, if it has one, and with it the
+    /// comparison inside the write (the patch itself is still one
+    /// `commit_patch`).
+    async fn commit_patch_if(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        state: HashState,
+        removed_index_macs: Vec<Vec<u8>>,
+        added: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        let stored = self
+            .get_version(name)
+            .await?
+            .as_ref()
+            .map(CollectionBase::from);
+        if stored != base {
+            return Ok(CollectionWrite::Conflict { stored });
+        }
+        self.commit_patch(name, state, &removed_index_macs, &added)
+            .await?;
+        Ok(CollectionWrite::Applied)
+    }
+
     /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
     /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
     /// entries would corrupt the next patch's ltHash.
     async fn clear_mutation_macs(&self, name: &str) -> Result<()>;
+
+    /// Replace a collection's MAC rows with exactly `macs` (an index MAC
+    /// repeated in `macs` keeps its last value), and its version record as
+    /// `record` says (kept, set or removed), on the condition that the
+    /// collection is still stored as `base`, compared as
+    /// [`commit_patch_if`](Self::commit_patch_if) compares it.
+    ///
+    /// An override must be one atomic operation, the comparison included: after
+    /// an error or a cancellation, storage holds the collection as it was or as
+    /// replaced, never the new MAC rows under the old record, nor the new
+    /// record over some of the old rows. Use one transaction or one shared
+    /// state lock. On a mismatch nothing is written and the call answers
+    /// [`CollectionWrite::Conflict`]; `Err` means what it means for
+    /// [`commit_patch`](Self::commit_patch). [`CollectionRecord::Keep`] makes
+    /// no write to the record at all, so a collection without MAC rows, given
+    /// none, is left exactly as it was, its record byte for byte.
+    ///
+    /// `macs` is passed by value, so a store that keeps the rows past the call
+    /// takes them without a copy: a snapshot's whole MAC set, at the memory
+    /// peak of its apply.
+    ///
+    /// The processor writes a snapshot and a snapshot recovery with it
+    /// ([`CollectionRecord::Set`], the new baseline and its MAC rows), and a
+    /// rebuild stands a collection down with it ([`CollectionRecord::Remove`],
+    /// no rows). The processor also clears with it the rows a reset collection
+    /// left behind ([`CollectionRecord::Keep`], no rows): before a list's
+    /// patches, whenever the collection is still without a baseline (version 0,
+    /// an empty ltHash) and the list's first patch, if any, is the genesis one,
+    /// so on a quiet sync of such a collection too. The default compares, then
+    /// clears and puts, and writes the record last for `Set` (deletes it first
+    /// for `Remove`), in separate calls: neither atomic nor fenced. Override it
+    /// with one transaction (the bundled stores do). A backend that wraps
+    /// another must forward this method: the default runs over the wrapper's
+    /// own methods, so it bypasses the wrapped store's override, if it has one,
+    /// and with it the atomicity and the comparison inside the write.
+    async fn replace_collection(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        record: CollectionRecord,
+        macs: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        let stored = self
+            .get_version(name)
+            .await?
+            .as_ref()
+            .map(CollectionBase::from);
+        if stored != base {
+            return Ok(CollectionWrite::Conflict { stored });
+        }
+        match record {
+            // The record as it is, which the comparison found to be the base,
+            // so the rows carry its version.
+            CollectionRecord::Keep => {
+                self.clear_mutation_macs(name).await?;
+                if !macs.is_empty() {
+                    let version = base.map_or(0, |base| base.version);
+                    self.put_mutation_macs(name, version, &macs).await?;
+                }
+            }
+            // The version last: an error part-way leaves the version the rows
+            // were written under, so the same snapshot is not skipped as stale
+            // when it comes again.
+            CollectionRecord::Set(state) => {
+                self.clear_mutation_macs(name).await?;
+                if !macs.is_empty() {
+                    self.put_mutation_macs(name, state.version, &macs).await?;
+                }
+                self.set_version(name, state).await?;
+            }
+            // The record first: no record over stale rows is a collection the
+            // next sync rebuilds, and the rebuild replaces the rows.
+            CollectionRecord::Remove => {
+                self.delete_version(name).await?;
+                self.clear_mutation_macs(name).await?;
+                if !macs.is_empty() {
+                    self.put_mutation_macs(name, 0, &macs).await?;
+                }
+            }
+        }
+        Ok(CollectionWrite::Applied)
+    }
 
     /// Get the most recently stored app state sync key ID.
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>>;
@@ -1536,6 +1670,72 @@ pub fn pending_group_sender(
 pub enum PendingInboundMutation {
     Applied,
     Conflict,
+}
+
+/// What a conditional collection write is built on and compared with
+/// ([`AppSyncStore::commit_patch_if`], [`AppSyncStore::replace_collection`]):
+/// the stored record's version and its ltHash. `None` in their `base` is no
+/// record.
+///
+/// The version alone does not say what is stored. A rebuild stands a collection
+/// down and fetches it again, and can land on the version it left (a quiet
+/// collection does), with the server's ltHash, which differs from the local one
+/// exactly when the local copy had diverged: the case the rebuild exists to
+/// repair. The ltHash is the collection's content, a set hash of its value
+/// MACs. A store that overrides the conditional writes moves it together with
+/// the rows, so there two records with one base hold the same collection, and a
+/// write built on one is as valid over the other. With the trait's defaults,
+/// which compare and write in separate calls, a writer landing in between, or a
+/// [`replace_collection`](AppSyncStore::replace_collection) stopped part-way,
+/// can leave a record over rows it does not describe. The record's flags are
+/// not part of the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionBase {
+    /// The collection's version.
+    pub version: u64,
+    /// The collection's ltHash at that version.
+    pub hash: [u8; 128],
+}
+
+impl From<&HashState> for CollectionBase {
+    fn from(state: &HashState) -> Self {
+        Self {
+            version: state.version,
+            hash: state.hash,
+        }
+    }
+}
+
+/// What [`AppSyncStore::replace_collection`] does with the collection's
+/// version record, beside replacing its MAC rows.
+#[derive(Debug, Clone)]
+pub enum CollectionRecord {
+    /// Left as stored, which the comparison found to be the base: only the MAC
+    /// rows are replaced, and they carry the stored version. The clear of a
+    /// collection still without a baseline, before its genesis patch or in a
+    /// sync with no patch.
+    Keep,
+    /// Replaced by this state: a snapshot's or a recovery's new baseline.
+    Set(HashState),
+    /// Deleted, the never-synced state
+    /// [`delete_version`](AppSyncStore::delete_version) leaves: a rebuild's
+    /// stand-down. The rows carry version 0.
+    Remove,
+}
+
+/// What a collection write conditioned on the stored record did
+/// ([`AppSyncStore::commit_patch_if`], [`AppSyncStore::replace_collection`]).
+///
+/// Exhaustive on purpose: a caller must decide what a conflict means for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a conflict wrote nothing"]
+pub enum CollectionWrite {
+    /// The collection was stored as the base; the write is committed.
+    Applied,
+    /// The collection was not stored as the base, and nothing was written.
+    /// `stored` is the base found (`None` for no record), on which a caller
+    /// that still wants the write can build it again.
+    Conflict { stored: Option<CollectionBase> },
 }
 
 /// Device data persistence operations.

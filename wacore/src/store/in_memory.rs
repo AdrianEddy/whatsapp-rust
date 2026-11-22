@@ -212,6 +212,68 @@ struct InMemoryState {
     device: Option<Device>,
 }
 
+/// The app-state writes, shared by the plain and the conditional methods so
+/// each conditional one compares and writes under the one lock it holds.
+impl InMemoryState {
+    /// The collection's base as `get_version` answers it.
+    fn stored_base(&self, name: &str) -> Option<CollectionBase> {
+        self.versions.get(name).map(CollectionBase::from)
+    }
+
+    /// Each `(index MAC, value MAC)` row. Borrowed rows are copied straight
+    /// into the stored buffers, with no intermediate `Vec`, and owned ones are
+    /// moved into them (an exact-capacity `Vec` converts without a copy), so
+    /// the stored buffers carry length but no spare capacity either way.
+    fn put_mutation_macs<B: Into<Box<[u8]>>>(
+        &mut self,
+        name: &str,
+        rows: impl IntoIterator<Item = (B, B)>,
+    ) {
+        for (index_mac, value_mac) in rows {
+            self.mutation_macs.insert(
+                MutationMacKey {
+                    collection: name.into(),
+                    index_mac: index_mac.into(),
+                },
+                value_mac.into(),
+            );
+        }
+    }
+
+    fn commit_patch<B: Into<Box<[u8]>>>(
+        &mut self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: impl IntoIterator<Item = (B, B)>,
+    ) {
+        self.versions.insert(name.to_string(), state);
+        for index_mac in removed_index_macs {
+            self.mutation_macs.remove(&MutationMacKeyRef {
+                collection: name,
+                index_mac,
+            });
+        }
+        self.put_mutation_macs(name, added);
+    }
+
+    fn clear_mutation_macs(&mut self, name: &str) {
+        self.mutation_macs
+            .retain(|k, _| k.collection.as_ref() != name);
+    }
+}
+
+/// Borrowed MAC rows, as [`InMemoryState::put_mutation_macs`] takes them.
+fn borrowed_rows(macs: &[AppStateMutationMAC]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    macs.iter()
+        .map(|mac| (mac.index_mac.as_slice(), mac.value_mac.as_slice()))
+}
+
+/// Owned MAC rows, their buffers moved.
+fn owned_rows(macs: Vec<AppStateMutationMAC>) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+    macs.into_iter().map(|mac| (mac.index_mac, mac.value_mac))
+}
+
 /// Hard cap on retained sent messages, bounding memory regardless of the
 /// configured retention window. Time-based pruning is the client's keepalive
 /// sweep (`delete_expired_sent_messages`, driven by
@@ -809,18 +871,10 @@ impl AppSyncStore for InMemoryBackend {
         _version: u64,
         mutations: &[AppStateMutationMAC],
     ) -> Result<()> {
-        let mut s = self.state.lock().await;
-        for m in mutations {
-            // Straight from the borrowed rows: no intermediate `Vec`, so the
-            // stored buffers carry length but no spare capacity.
-            s.mutation_macs.insert(
-                MutationMacKey {
-                    collection: name.into(),
-                    index_mac: m.index_mac.as_slice().into(),
-                },
-                m.value_mac.as_slice().into(),
-            );
-        }
+        self.state
+            .lock()
+            .await
+            .put_mutation_macs(name, borrowed_rows(mutations));
         Ok(())
     }
 
@@ -855,33 +909,61 @@ impl AppSyncStore for InMemoryBackend {
         removed_index_macs: &[Vec<u8>],
         added: &[AppStateMutationMAC],
     ) -> Result<()> {
-        let mut s = self.state.lock().await;
-        s.versions.insert(name.to_string(), state);
-        for index_mac in removed_index_macs {
-            s.mutation_macs.remove(&MutationMacKeyRef {
-                collection: name,
-                index_mac,
-            });
-        }
-        for m in added {
-            s.mutation_macs.insert(
-                MutationMacKey {
-                    collection: name.into(),
-                    index_mac: m.index_mac.as_slice().into(),
-                },
-                m.value_mac.as_slice().into(),
-            );
-        }
-        Ok(())
-    }
-
-    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
         self.state
             .lock()
             .await
-            .mutation_macs
-            .retain(|k, _| k.collection.as_ref() != name);
+            .commit_patch(name, state, removed_index_macs, borrowed_rows(added));
         Ok(())
+    }
+
+    /// Compared and committed under the one lock, the added rows moved in.
+    async fn commit_patch_if(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        state: HashState,
+        removed_index_macs: Vec<Vec<u8>>,
+        added: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        let mut s = self.state.lock().await;
+        let stored = s.stored_base(name);
+        if stored != base {
+            return Ok(CollectionWrite::Conflict { stored });
+        }
+        s.commit_patch(name, state, &removed_index_macs, owned_rows(added));
+        Ok(CollectionWrite::Applied)
+    }
+
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        self.state.lock().await.clear_mutation_macs(name);
+        Ok(())
+    }
+
+    /// Compared and replaced under the one lock, the rows moved in.
+    async fn replace_collection(
+        &self,
+        name: &str,
+        base: Option<CollectionBase>,
+        record: CollectionRecord,
+        macs: Vec<AppStateMutationMAC>,
+    ) -> Result<CollectionWrite> {
+        let mut s = self.state.lock().await;
+        let stored = s.stored_base(name);
+        if stored != base {
+            return Ok(CollectionWrite::Conflict { stored });
+        }
+        s.clear_mutation_macs(name);
+        s.put_mutation_macs(name, owned_rows(macs));
+        match record {
+            CollectionRecord::Keep => {}
+            CollectionRecord::Set(state) => {
+                s.versions.insert(name.to_string(), state);
+            }
+            CollectionRecord::Remove => {
+                s.versions.remove(name);
+            }
+        }
+        Ok(CollectionWrite::Applied)
     }
 
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
