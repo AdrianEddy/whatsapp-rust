@@ -54,31 +54,11 @@ struct PreKeyEntry {
     record: Bytes,
 }
 
-/// Key for the mutation-MAC store: `(collection_name, index_mac)`.
+/// One collection's value MACs by index MAC.
 ///
 /// These buffers never grow in place, so boxed storage avoids a capacity
 /// word per buffer while preserving arbitrary byte lengths.
-#[derive(Eq, Hash, PartialEq)]
-struct MutationMacKey {
-    collection: Box<str>,
-    index_mac: Box<[u8]>,
-}
-
-/// Hashes and compares exactly like [`MutationMacKey`] to satisfy
-/// [`Equivalent`]. Lookups and removals allocate no temporary key.
-#[derive(Hash)]
-struct MutationMacKeyRef<'a> {
-    collection: &'a str,
-    index_mac: &'a [u8],
-}
-
-impl Equivalent<MutationMacKey> for MutationMacKeyRef<'_> {
-    fn equivalent(&self, key: &MutationMacKey) -> bool {
-        self.collection == key.collection.as_ref() && self.index_mac == key.index_mac.as_ref()
-    }
-}
-
-type MutationMacMap = HbHashMap<MutationMacKey, Box<[u8]>, RandomState>;
+type CollectionMacs = HashMap<Box<[u8]>, Box<[u8]>>;
 
 /// Key for base-key collision detection: `(address, message_id)`.
 #[derive(Eq, Hash, PartialEq)]
@@ -178,8 +158,10 @@ struct InMemoryState {
     sync_keys: HashMap<Vec<u8>, AppStateSyncKey>,
     latest_sync_key_id: Option<Vec<u8>>,
     versions: HashMap<String, HashState>,
-    /// Raw value MACs indexed by [`MutationMacKey`].
-    mutation_macs: MutationMacMap,
+    /// Raw value MACs, each collection's in a map of its own, so replacing or
+    /// clearing one takes its rows with it and leaves the others' alone. A
+    /// collection without rows has no map.
+    mutation_macs: HashMap<Box<str>, CollectionMacs>,
 
     // --- Protocol ---
     /// Unified per-device sender key tracking: group_jid -> (device_jid -> has_key)
@@ -229,14 +211,30 @@ impl InMemoryState {
         name: &str,
         rows: impl IntoIterator<Item = (B, B)>,
     ) {
-        for (index_mac, value_mac) in rows {
-            self.mutation_macs.insert(
-                MutationMacKey {
-                    collection: name.into(),
-                    index_mac: index_mac.into(),
-                },
-                value_mac.into(),
-            );
+        let mut rows = rows
+            .into_iter()
+            .map(|(index_mac, value_mac)| (index_mac.into(), value_mac.into()))
+            .peekable();
+        if rows.peek().is_none() {
+            return;
+        }
+        match self.mutation_macs.get_mut(name) {
+            Some(macs) => macs.extend(rows),
+            None => {
+                self.mutation_macs.insert(name.into(), rows.collect());
+            }
+        }
+    }
+
+    fn delete_mutation_macs(&mut self, name: &str, index_macs: &[Vec<u8>]) {
+        let Some(macs) = self.mutation_macs.get_mut(name) else {
+            return;
+        };
+        for index_mac in index_macs {
+            macs.remove(index_mac.as_slice());
+        }
+        if macs.is_empty() {
+            self.mutation_macs.remove(name);
         }
     }
 
@@ -248,18 +246,14 @@ impl InMemoryState {
         added: impl IntoIterator<Item = (B, B)>,
     ) {
         self.versions.insert(name.to_string(), state);
-        for index_mac in removed_index_macs {
-            self.mutation_macs.remove(&MutationMacKeyRef {
-                collection: name,
-                index_mac,
-            });
-        }
+        self.delete_mutation_macs(name, removed_index_macs);
         self.put_mutation_macs(name, added);
     }
 
-    fn clear_mutation_macs(&mut self, name: &str) {
-        self.mutation_macs
-            .retain(|k, _| k.collection.as_ref() != name);
+    /// The collection's rows, taken out whole: the caller drops them, after the
+    /// lock where that matters.
+    fn take_mutation_macs(&mut self, name: &str) -> Option<CollectionMacs> {
+        self.mutation_macs.remove(name)
     }
 }
 
@@ -884,21 +878,16 @@ impl AppSyncStore for InMemoryBackend {
             .lock()
             .await
             .mutation_macs
-            .get(&MutationMacKeyRef {
-                collection: name,
-                index_mac,
-            })
+            .get(name)
+            .and_then(|macs| macs.get(index_mac))
             .map(|mac| mac.to_vec()))
     }
 
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
-        let mut s = self.state.lock().await;
-        for im in index_macs {
-            s.mutation_macs.remove(&MutationMacKeyRef {
-                collection: name,
-                index_mac: im,
-            });
-        }
+        self.state
+            .lock()
+            .await
+            .delete_mutation_macs(name, index_macs);
         Ok(())
     }
 
@@ -935,11 +924,14 @@ impl AppSyncStore for InMemoryBackend {
     }
 
     async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
-        self.state.lock().await.clear_mutation_macs(name);
+        let cleared = self.state.lock().await.take_mutation_macs(name);
+        drop(cleared);
         Ok(())
     }
 
-    /// Compared and replaced under the one lock, the rows moved in.
+    /// The replacement's table is built before the lock, its rows moved in;
+    /// under the one lock the stored base is compared and the table swapped
+    /// in. The rows it replaces, or a refused replacement, are dropped after it.
     async fn replace_collection(
         &self,
         name: &str,
@@ -947,13 +939,21 @@ impl AppSyncStore for InMemoryBackend {
         record: CollectionRecord,
         macs: Vec<AppStateMutationMAC>,
     ) -> Result<CollectionWrite> {
+        // Declared before the guard, so a refused one drops after it.
+        let rows: CollectionMacs = owned_rows(macs)
+            .map(|(index_mac, value_mac)| (index_mac.into(), value_mac.into()))
+            .collect();
         let mut s = self.state.lock().await;
         let stored = s.stored_base(name);
         if stored != base {
             return Ok(CollectionWrite::Conflict { stored });
         }
-        s.clear_mutation_macs(name);
-        s.put_mutation_macs(name, owned_rows(macs));
+        // A collection without rows holds no map.
+        let replaced = if rows.is_empty() {
+            s.take_mutation_macs(name)
+        } else {
+            s.mutation_macs.insert(name.into(), rows)
+        };
         match record {
             CollectionRecord::Keep => {}
             CollectionRecord::Set(state) => {
@@ -963,6 +963,8 @@ impl AppSyncStore for InMemoryBackend {
                 s.versions.remove(name);
             }
         }
+        drop(s);
+        drop(replaced);
         Ok(CollectionWrite::Applied)
     }
 
@@ -1831,10 +1833,12 @@ impl DeviceStore for InMemoryBackend {
                     .map(|(ik, iv)| ik.capacity() + iv.capacity())
                     .sum::<usize>()
         });
-        bytes += hb_table_bytes(&state.mutation_macs);
-        rows += state.mutation_macs.len() as u64;
-        for (k, v) in &state.mutation_macs {
-            bytes += k.collection.len() + k.index_mac.len() + v.len();
+        bytes += table_bytes(&state.mutation_macs);
+        for (name, macs) in &state.mutation_macs {
+            bytes += name.len();
+            account!(macs, |index_mac: &[u8], value_mac: &[u8]| {
+                index_mac.len() + value_mac.len()
+            });
         }
         account!(
             state.sender_key_devices,
@@ -2775,7 +2779,7 @@ mod tests {
         // struct has the same layout as an equivalent tuple. The relational
         // budget remains valid on 32- and 64-bit targets without prescribing a
         // pointer width or relying on unspecified field ordering.
-        let compact = size_of::<(MutationMacKey, Box<[u8]>)>();
+        let compact = size_of::<(Box<[u8]>, Box<[u8]>)>();
         let previous = size_of::<((String, Vec<u8>), Vec<u8>)>();
         assert!(
             previous - compact >= size_of::<usize>(),
@@ -2803,13 +2807,13 @@ mod tests {
 
         let expected = {
             let state = backend.state.lock().await;
-            let table = hb_table_bytes(&state.mutation_macs);
-            let payload = state
-                .mutation_macs
+            let macs = &state.mutation_macs[name];
+            let tables = table_bytes(&state.mutation_macs) + table_bytes(macs);
+            let payload = macs
                 .iter()
-                .map(|(key, value)| key.collection.len() + key.index_mac.len() + value.len())
+                .map(|(index_mac, value_mac)| index_mac.len() + value_mac.len())
                 .sum::<usize>();
-            table + payload
+            tables + name.len() + payload
         };
         let report = backend.resource_report().await;
         assert_eq!(report.pages, Some(1));
@@ -4016,3 +4020,6 @@ mod tests {
         assert_eq!(report.total_bytes(), 0, "an absent figure totals as zero");
     }
 }
+
+#[cfg(test)]
+mod mc_tests;

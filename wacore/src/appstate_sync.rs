@@ -566,8 +566,8 @@ pub enum AppStateSyncError {
     /// a local copy that had diverged.
     #[error(
         "app-state collection changed under the apply: built on {}, stored {}{}",
-        version_label(.base),
-        version_label(.stored),
+        VersionLabel(.base),
+        VersionLabel(.stored),
         hash_label(.base, .stored)
     )]
     VersionConflict {
@@ -577,10 +577,14 @@ pub enum AppStateSyncError {
 }
 
 /// A collection's stored version in an error message.
-fn version_label(version: &Option<u64>) -> String {
-    match version {
-        Some(version) => format!("v{version}"),
-        None => "no record".to_owned(),
+struct VersionLabel<'a>(&'a Option<u64>);
+
+impl std::fmt::Display for VersionLabel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(version) => write!(f, "v{version}"),
+            None => f.write_str("no record"),
+        }
     }
 }
 

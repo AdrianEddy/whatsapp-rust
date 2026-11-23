@@ -1,6 +1,7 @@
 //! WF13: the conditional pending-inbound batch methods, each one immediate
 //! transaction whose rows are compared and written as the single-row methods
 //! do, and the single-row replacement's bound checked before any transaction.
+//! WF20: the chunked insert of a collection's MAC rows.
 
 use super::*;
 
@@ -269,4 +270,82 @@ async fn oversized_single_replacement_refused_before_the_write_queue() {
         stored(&store, "X").await.as_deref(),
         Some(&b"sixteen bytes!!!"[..])
     );
+}
+
+/// WF20: a MAC set is bound a chunk at a time, and every row of it lands,
+/// whatever its size against the chunk's; the last of two rows of one index
+/// MAC is the one kept, in one chunk and across two.
+#[tokio::test]
+async fn mac_sets_of_every_chunk_shape_are_stored_whole() {
+    let store = open_store().await;
+    let mac = |index: usize, value: u8| AppStateMutationMAC {
+        index_mac: index.to_be_bytes().to_vec(),
+        value_mac: vec![value; 32],
+    };
+    for rows in [0, 1, 99, 100, 101, 200, 250] {
+        let name = format!("collection-{rows}");
+        let mut macs: Vec<_> = (0..rows).map(|index| mac(index, 1)).collect();
+        if rows > 100 {
+            // A second row of the first index, two chunks or one chunk on.
+            macs.push(mac(0, 2));
+        }
+        if rows > 1 {
+            macs.push(mac(1, 3));
+        }
+        store.put_mutation_macs(&name, 7, &macs).await.unwrap();
+        for index in 0..rows {
+            let value = match index {
+                0 if rows > 100 => 2,
+                1 if rows > 1 => 3,
+                _ => 1,
+            };
+            assert_eq!(
+                store
+                    .get_mutation_mac(&name, &index.to_be_bytes())
+                    .await
+                    .unwrap(),
+                Some(vec![value; 32]),
+                "row {index} of {rows}"
+            );
+        }
+        assert_eq!(
+            store
+                .get_mutation_mac(&name, &rows.to_be_bytes())
+                .await
+                .unwrap(),
+            None,
+            "no row past the last of {rows}"
+        );
+    }
+}
+
+/// WF20: the buffer the chunks share holds one chunk's rows at a time, so each
+/// row is written once.
+#[tokio::test]
+async fn mac_set_rows_are_written_once() {
+    const ROWS: usize = 250;
+    let store = open_store().await;
+    let macs: Vec<_> = (0..ROWS)
+        .map(|index| AppStateMutationMAC {
+            index_mac: index.to_be_bytes().to_vec(),
+            value_mac: vec![1; 32],
+        })
+        .collect();
+    let written = store
+        .write_blocking(move |conn| {
+            fn changes(conn: &mut SqliteConnection) -> Result<i64> {
+                diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                    "total_changes()",
+                ))
+                .get_result(conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))
+            }
+            let before = changes(conn)?;
+            insert_app_state_mutation_macs(conn, "collection", 7, &macs, 1)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(changes(conn)? - before)
+        })
+        .await
+        .unwrap();
+    assert_eq!(written, ROWS as i64);
 }

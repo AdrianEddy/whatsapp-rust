@@ -468,9 +468,16 @@ fn insert_app_state_mutation_macs(
     mutations: &[AppStateMutationMAC],
     device_id: i32,
 ) -> std::result::Result<(), DieselError> {
-    let records: Vec<_> = mutations
-        .iter()
-        .map(|m| {
+    // SQLite's variable limit is typically 999 or 32766; five columns per
+    // row keeps 100 rows at 500 parameters.
+    const CHUNK_SIZE: usize = 100;
+    // The bind tuples are built a chunk at a time, in one buffer: a snapshot's
+    // whole MAC set at once would be a second copy of its size, at the apply's
+    // memory peak.
+    let mut records = Vec::with_capacity(mutations.len().min(CHUNK_SIZE));
+    for chunk in mutations.chunks(CHUNK_SIZE) {
+        records.clear();
+        records.extend(chunk.iter().map(|m| {
             (
                 app_state_mutation_macs::name.eq(name),
                 app_state_mutation_macs::version.eq(version as i64),
@@ -478,14 +485,9 @@ fn insert_app_state_mutation_macs(
                 app_state_mutation_macs::value_mac.eq(&m.value_mac),
                 app_state_mutation_macs::device_id.eq(device_id),
             )
-        })
-        .collect();
-    // SQLite's variable limit is typically 999 or 32766; five columns per
-    // row keeps 100 rows at 500 parameters.
-    const CHUNK_SIZE: usize = 100;
-    for chunk in records.chunks(CHUNK_SIZE) {
+        }));
         diesel::insert_into(app_state_mutation_macs::table)
-            .values(chunk)
+            .values(&records)
             .on_conflict((
                 app_state_mutation_macs::name,
                 app_state_mutation_macs::index_mac,

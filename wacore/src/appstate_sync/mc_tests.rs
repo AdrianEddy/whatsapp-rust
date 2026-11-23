@@ -1334,3 +1334,20 @@ async fn appstate_recovery_over_a_moved_collection_writes_nothing() {
         (0, 1)
     );
 }
+
+/// What a conflict says of the two records (WF20 formats it without a string
+/// per record): their versions, no record for either, and the ltHash where the
+/// versions alone would read the same.
+#[test]
+fn version_conflict_names_the_two_records() {
+    let message = |base, stored| AppStateSyncError::VersionConflict { base, stored }.to_string();
+    let prefix = "app-state collection changed under the apply: built on ";
+    for (base, stored, said) in [
+        (Some(11), Some(13), "v11, stored v13"),
+        (None, Some(6), "no record, stored v6"),
+        (Some(7), None, "v7, stored no record"),
+        (Some(7), Some(7), "v7, stored v7 with another ltHash"),
+    ] {
+        assert_eq!(message(base, stored), format!("{prefix}{said}"));
+    }
+}
