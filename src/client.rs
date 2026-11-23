@@ -2502,6 +2502,9 @@ pub struct Client {
     /// Optional decrypt failure admission, fixed during assembly.
     pub(crate) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
 
+    /// Optional check of the account a pairing names, fixed during assembly.
+    pub(crate) pair_admission: Option<Arc<dyn crate::PairAdmission>>,
+
     /// Optional run-loop dial admission policy, fixed during assembly.
     pub(crate) connect_admission:
         Option<Arc<dyn crate::types::connect_admission::ConnectAdmission>>,

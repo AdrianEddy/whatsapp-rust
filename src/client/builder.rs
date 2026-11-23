@@ -555,6 +555,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Check the account a phone pairs this device with before the pairing is
+    /// committed. The last registration wins. See [`crate::PairAdmission`].
+    pub fn with_pair_admission<A: crate::PairAdmission + 'static>(self, policy: A) -> Self {
+        self.with_pair_admission_arc(Arc::new(policy))
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_pair_admission_arc(mut self, policy: Arc<dyn crate::PairAdmission>) -> Self {
+        self.extensions_mut().pair_admission = Some(policy);
+        self
+    }
+
     /// Configure the synchronous decrypt failure admission policy before services start.
     /// The last registration wins. Live tuning belongs inside the policy.
     pub fn with_decrypt_failure_admission<A: crate::DecryptFailureAdmission + 'static>(
@@ -1214,6 +1226,7 @@ pub(super) struct ClientExtensions {
     pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
     pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
     pub(super) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
+    pub(super) pair_admission: Option<Arc<dyn crate::PairAdmission>>,
 
     #[cfg(feature = "client-lifecycle")]
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,

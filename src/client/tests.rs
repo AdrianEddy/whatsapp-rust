@@ -3835,6 +3835,8 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<Option<Arc<dyn crate::AppStateDurabilityHook>>>();
     // So is the offline admission hook.
     expected += size_of::<Option<Arc<dyn crate::OfflineAdmissionHook>>>();
+    // And so is the pair admission.
+    expected += size_of::<Option<Arc<dyn crate::PairAdmission>>>();
     #[cfg(feature = "generated-group-notifications")]
     {
         // Contextual group parsing retains its own immutable provider cell.

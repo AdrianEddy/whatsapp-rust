@@ -1,6 +1,7 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
-use crate::types::events::{Event, PairError, PairSuccess};
+use crate::types::events::{Event, PairError, PairErrorReason, PairSuccess};
+use crate::types::pair_admission::{PairCandidate, PairDecision};
 use futures::FutureExt;
 use log::{error, info, warn};
 
@@ -371,6 +372,42 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
+            // The last moment the account can be refused: what follows commits
+            // its identity and signs it for the server, which lists the
+            // companion from then on.
+            if let Some(admission) = &client.pair_admission
+                && admission.decide(&PairCandidate {
+                    id: &jid,
+                    lid: &lid,
+                    business_name: &business_name,
+                    platform: &platform,
+                }) == PairDecision::Refuse
+            {
+                drop(pair_code_state);
+                warn!(
+                    "Pairing with {} refused by the host's pair admission",
+                    jid.observe()
+                );
+                let error_node = PairUtils::build_pair_error_node(&req_id, 500, "internal-error");
+                if let Err(send_err) = client.send_node(error_node).await {
+                    error!("Failed to send pair error node: {send_err}");
+                }
+                if stopped() {
+                    return;
+                }
+                client.core.event_bus.dispatch(Event::PairError(
+                    PairError::builder()
+                        .id(jid)
+                        .lid(lid)
+                        .business_name(business_name)
+                        .platform(platform)
+                        .error("refused by the host's pair admission".to_string())
+                        .reason(PairErrorReason::LocalRefusal)
+                        .build(),
+                ));
+                return;
+            }
+
             // Both retired only once the identity and its HMAC check out. A
             // pair-success that arrives after its own flow was written off can
             // otherwise cancel the replacement that succeeded it, and then fail
@@ -1149,3 +1186,6 @@ pub(crate) mod tests {
         .await;
     }
 }
+
+#[cfg(test)]
+mod mc_tests;

@@ -1689,6 +1689,21 @@ pub struct PairError {
     pub business_name: String,
     pub platform: String,
     pub error: String,
+    /// Whose refusal it is.
+    #[builder(default)]
+    pub reason: PairErrorReason,
+}
+
+/// Why a `pair-success` did not pair this device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairErrorReason {
+    /// It did not verify (a forged one, say), or could not be completed.
+    #[default]
+    Failed,
+    /// It verified, and the host's pair admission refused the account it names.
+    LocalRefusal,
 }
 
 /// A QR code the consumer renders during multi-device pairing.

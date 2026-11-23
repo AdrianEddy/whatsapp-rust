@@ -1425,6 +1425,19 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Check the account a phone pairs this device with before the pairing is
+    /// committed. The last registration wins. See [`crate::PairAdmission`].
+    pub fn with_pair_admission<A: crate::PairAdmission + 'static>(mut self, policy: A) -> Self {
+        self.client_builder = self.client_builder.with_pair_admission(policy);
+        self
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_pair_admission_arc(mut self, policy: Arc<dyn crate::PairAdmission>) -> Self {
+        self.client_builder = self.client_builder.with_pair_admission_arc(policy);
+        self
+    }
+
     /// Configure the synchronous decrypt failure admission policy before services start.
     /// The last registration wins.
     pub fn with_decrypt_failure_admission<A: crate::DecryptFailureAdmission + 'static>(
