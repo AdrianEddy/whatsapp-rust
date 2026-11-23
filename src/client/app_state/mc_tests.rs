@@ -27,6 +27,10 @@
 //! The re-sync after a send whose commit is refused that way syncs again at
 //! once, and a recovery from the primary refused that way is converged by a
 //! sync.
+//!
+//! WF19 (`conflicts`): in a batched round that refusal is one collection's. It
+//! is synced again later, after what its list committed before it is announced,
+//! and the round's other collections are applied as if it hadn't been there.
 
 use super::*;
 use crate::client::ClientBuilder;
@@ -106,9 +110,10 @@ struct Host {
     backend: Arc<dyn Backend>,
     seen: std::sync::Mutex<Vec<Seen>>,
     refuse: AtomicBool,
-    /// Holds the next commit until the test lets it go, as a commit waiting on
-    /// the host's database would.
+    /// Holds a commit until the test lets it go, as a commit waiting on the
+    /// host's database would: the next one, or the one after `park_skips` more.
     park: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    park_skips: AtomicUsize,
     /// Woken by each `ArchiveUpdate`, for a test waiting on work the client
     /// runs in the background.
     announced: tokio::sync::Notify,
@@ -116,7 +121,11 @@ struct Host {
 
 impl Host {
     async fn new() -> Arc<Self> {
-        let backend = crate::test_utils::create_test_backend().await;
+        Self::over(crate::test_utils::create_test_backend().await).await
+    }
+
+    /// [`Self::new`], over the test's own store.
+    async fn over(backend: Arc<dyn Backend>) -> Arc<Self> {
         backend
             .set_sync_key(
                 KEY_ID,
@@ -132,6 +141,7 @@ impl Host {
             seen: std::sync::Mutex::new(Vec::new()),
             refuse: AtomicBool::new(false),
             park: std::sync::Mutex::new(None),
+            park_skips: AtomicUsize::new(0),
             announced: tokio::sync::Notify::new(),
         })
     }
@@ -154,8 +164,14 @@ impl Host {
     /// Park the next commit: the receiver resolves once it is parked, and
     /// sending on the sender lets it return.
     fn park_next(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.park_after(0)
+    }
+
+    /// [`Self::park_next`] for the commit after `skips` more.
+    fn park_after(&self, skips: usize) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, parked) = oneshot::channel();
         let (release, released) = oneshot::channel();
+        self.park_skips.store(skips, Ordering::SeqCst);
         *self.park.lock().expect("park lock") = Some((entered, released));
         (parked, release)
     }
@@ -210,12 +226,25 @@ impl crate::AppStateDurabilityHook for Host {
             full_sync: batch.full_sync,
             cursor,
         });
-        let park = self.park.lock().expect("park lock").take();
+        // Taken before the park: a test that refuses while a commit is parked
+        // refuses the ones after it.
+        let refuse = self.refuse.load(Ordering::SeqCst);
+        let skipped = self
+            .park_skips
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |skips| {
+                skips.checked_sub(1)
+            })
+            .is_ok();
+        let park = if skipped {
+            None
+        } else {
+            self.park.lock().expect("park lock").take()
+        };
         if let Some((entered, release)) = park {
             entered.send(()).expect("the test waits for the park");
             release.await.expect("the test releases the park");
         }
-        if self.refuse.load(Ordering::SeqCst) {
+        if refuse {
             return Err(Refused.into());
         }
         Ok(())
@@ -376,33 +405,41 @@ fn archive_record(chat: &str, timestamp: i64) -> wa::SyncdRecord {
     record
 }
 
+/// The next patch of `collection`, which `state` is: one archive of `chat`, an
+/// index the collection lacks.
+fn next_patch(
+    collection: WAPatchName,
+    state: &mut HashState,
+    chat: &str,
+    timestamp: i64,
+) -> wa::SyncdPatch {
+    let keys = expand_app_state_keys(&MASTER_KEY);
+    let mut mutation = wa::SyncdMutation::default();
+    mutation.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
+    mutation.record = buffa::MessageField::some(archive_record(chat, timestamp));
+
+    let mutations = vec![mutation];
+    let (_, folded) = state.update_hash(&mutations, |_, _| Ok(None));
+    folded.expect("a new index folds into the ltHash");
+    state.version += 1;
+    let mut patch = wa::SyncdPatch::default();
+    patch.version = version(state.version);
+    patch.mutations = mutations;
+    patch.key_id = key_id();
+    patch.snapshot_mac = Some(state.generate_snapshot_mac(collection.as_str(), &keys.snapshot_mac));
+    patch.patch_mac = Some(generate_patch_mac(
+        &patch,
+        collection.as_str(),
+        &keys.patch_mac,
+        state.version,
+    ));
+    patch
+}
+
 impl Server {
     /// The next patch: one archive of `chat`, an index the collection lacks.
     fn patch(&mut self, chat: &str, timestamp: i64) -> wa::SyncdPatch {
-        let keys = expand_app_state_keys(&MASTER_KEY);
-        let mut mutation = wa::SyncdMutation::default();
-        mutation.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
-        mutation.record = buffa::MessageField::some(archive_record(chat, timestamp));
-
-        let mutations = vec![mutation];
-        let (_, folded) = self.state.update_hash(&mutations, |_, _| Ok(None));
-        folded.expect("a new index folds into the ltHash");
-        self.state.version += 1;
-        let mut patch = wa::SyncdPatch::default();
-        patch.version = version(self.state.version);
-        patch.mutations = mutations;
-        patch.key_id = key_id();
-        patch.snapshot_mac = Some(
-            self.state
-                .generate_snapshot_mac(COLLECTION.as_str(), &keys.snapshot_mac),
-        );
-        patch.patch_mac = Some(generate_patch_mac(
-            &patch,
-            COLLECTION.as_str(),
-            &keys.patch_mac,
-            self.state.version,
-        ));
-        patch
+        next_patch(COLLECTION, &mut self.state, chat, timestamp)
     }
 
     /// The collection rebuilt as a snapshot at `at` holding `chats`' archives,
@@ -1480,8 +1517,8 @@ async fn bootstrap_owed_with_a_stored_key_skips_the_key_share_grace() {
 // stage's scenario: the hook parks on a signal; the generation moves on (for a
 // reconnect); another writer commits a newer version; the hook is released.
 // Either way the held sync writes nothing over the newer version, announces
-// nothing and fails retryably, and the collection's next sync goes on from the
-// newer version.
+// nothing and leaves the collection to be retried, and the collection's next
+// sync goes on from the newer version.
 
 const FOURTH_CHAT: &str = "120363000000000045@g.us";
 
@@ -1518,30 +1555,30 @@ impl Mover {
             .expect("the test store takes a patch");
     }
 
-    /// The held sync's error: the retirement, or the store's conflict over
-    /// `base` with `stored`. Either is retryable: the collection is synced
-    /// again as any failed sync is, and the primary is asked for nothing.
-    fn failed(self, error: &anyhow::Error, base: Option<u64>, stored: u64) {
-        let found = error.downcast_ref::<AppStateSyncError>();
+    /// How the held sync ends: the retirement is its error, and the store's
+    /// conflict sets the collection aside. Either leaves the collection to be
+    /// synced again, and asks the primary for nothing.
+    fn ended(self, held: Result<BatchedSyncOutcome>) {
         match self {
-            Mover::Reconnect => assert!(
-                matches!(found, Some(AppStateSyncError::Retired)),
-                "{error:#}"
-            ),
-            Mover::Unseen => assert!(
-                matches!(
-                    found,
-                    Some(AppStateSyncError::VersionConflict { base: b, stored: Some(s) })
-                        if *b == base && *s == stored
-                ),
-                "{error:#}"
+            Mover::Reconnect => {
+                let error = held.expect_err("a retired sync fails");
+                assert!(
+                    matches!(error.downcast_ref(), Some(AppStateSyncError::Retired)),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    RecoveryRequest::for_error(COLLECTION, error.downcast_ref()),
+                    RecoveryRequest::NotNeeded,
+                );
+            }
+            Mover::Unseen => assert_eq!(
+                held.expect("a conflict ends no round"),
+                BatchedSyncOutcome {
+                    reached_server: true,
+                    ..BatchedSyncOutcome::all_retryable(&[COLLECTION])
+                },
             ),
         }
-        assert_eq!(
-            RecoveryRequest::for_error(COLLECTION, error.downcast_ref()),
-            RecoveryRequest::NotNeeded,
-            "{self:?}"
-        );
     }
 }
 
@@ -1567,17 +1604,16 @@ async fn patch_held_while_the_collection_moves(mover: Mover) {
         let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
         futures::join!(synced, move_it).0
     };
-    let error = serve(
+    let ended = serve(
         &client,
         &transport,
         0,
         vec![page(false, vec![held])],
         held_sync,
     )
-    .await
-    .expect_err("the held sync fails");
+    .await;
 
-    mover.failed(&error, Some(7), 9);
+    mover.ended(ended);
     assert_eq!(
         host.take(),
         vec![commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7))],
@@ -1637,17 +1673,16 @@ async fn snapshot_held_while_the_collection_moves(mover: Mover) {
         let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
         futures::join!(synced, move_it).0
     };
-    let error = serve(
+    let ended = serve(
         &client,
         &transport,
         0,
         vec![snapshot_page(reference)],
         held_sync,
     )
-    .await
-    .expect_err("the held sync fails");
+    .await;
 
-    mover.failed(&error, None, 6);
+    mover.ended(ended);
     assert_eq!(
         host.take(),
         vec![commit(
@@ -1757,17 +1792,16 @@ async fn app_state_patch_held_across_a_rebuild_to_its_version_writes_nothing() {
         let synced = client.sync_collections_batched(vec![COLLECTION], client.sync_scope(None));
         futures::join!(synced, rebuild).0
     };
-    let error = serve(
+    let ended = serve(
         &client,
         &transport,
         0,
         vec![page(false, vec![held.clone()])],
         held_sync,
     )
-    .await
-    .expect_err("the held sync fails");
+    .await;
 
-    Mover::Unseen.failed(&error, Some(7), 7);
+    Mover::Unseen.ended(ended);
     assert_eq!(
         host.take(),
         vec![commit(COLLECTION, Patch, 8, &[FIRST_CHAT], false, Some(7))],
@@ -1951,3 +1985,6 @@ async fn app_state_recovery_refused_by_the_store_converges_by_a_sync() {
     );
     assert_eq!(host.version(COLLECTION).await, Some(5));
 }
+
+#[path = "mc_tests/conflicts.rs"]
+mod conflicts;

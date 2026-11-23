@@ -575,6 +575,18 @@ enum Recovery {
     Failed(anyhow::Error),
 }
 
+/// Whether the store refused an apply's write because another writer moved the
+/// collection after the apply read it, whatever the list committed before it.
+fn is_version_conflict(error: &anyhow::Error) -> bool {
+    use crate::appstate_sync::AppStateSyncError;
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref(),
+            Some(AppStateSyncError::VersionConflict { .. })
+        )
+    })
+}
+
 fn unaccounted_for(
     name: WAPatchName,
     responded: &HashSet<WAPatchName>,
@@ -1008,14 +1020,7 @@ impl Client {
                     // writer that keeps moving the collection is left to the
                     // scheduler's backoff. In-process it is this sync that
                     // loses, to a retired connection's write still in flight.
-                    let conflict = e
-                        .downcast_ref::<crate::appstate_sync::AppStateSyncError>()
-                        .is_some_and(|ase| {
-                            matches!(
-                                ase,
-                                crate::appstate_sync::AppStateSyncError::VersionConflict { .. }
-                            )
-                        });
+                    let conflict = is_version_conflict(&e);
                     if conflict && !conflict_retried {
                         conflict_retried = true;
                         info!(target: "Client/AppState", "{name:?} moved under its sync ({e}); syncing it again from the stored version");
@@ -2025,7 +2030,6 @@ impl Client {
         request: BatchedSyncRequest,
         outcome: &mut BatchedSyncOutcome,
     ) -> Result<()> {
-        use wacore::appstate::patch_decode::CollectionSyncError;
         let authoritative = self.authoritative_app_state()?;
         // WA Web's own bound. Its loop reads `(l < y || (i.length > 0 && l < C))`
         // with `y = 5` and `C = 500`, and since the body only runs while there
@@ -2313,6 +2317,14 @@ impl Client {
             // The error still ends the run — after what was applied has been
             // dispatched.
             let mut apply_error = None;
+            // A collection whose write the store refused, because another
+            // writer moved it while it was applied. Nothing of the refused
+            // write is owed, and the conflict is that collection's alone, so
+            // the round goes on with the rest; what the collection's list
+            // committed before it is dispatched below, and the collection
+            // synced again later from the version that writer left. A retired
+            // scope is not one collection's: it ends the round like any error.
+            let mut conflicts = Vec::new();
             // What the response actually carried, captured before the apply
             // consumes it: a collection that came back and failed to apply is a
             // different fact from one the server never mentioned, and the two
@@ -2348,6 +2360,13 @@ impl Client {
                 };
                 match processing.await {
                     Ok(applied) => results.push(applied),
+                    Err(e) if is_version_conflict(&e) && self.admits(scope).is_ok() => {
+                        info!(
+                            target: "Client/AppState",
+                            "Batched sync: {name:?} moved while it was applied ({e}); syncing it again later"
+                        );
+                        conflicts.push((name, e));
+                    }
                     Err(e) => {
                         // Named here or nowhere: the loop stops on the first
                         // failure, and the collections behind it are reported as
@@ -2386,19 +2405,18 @@ impl Client {
                 // lost for good, `setting_pushName` and the NCT salt included.
                 // The scope is checked before the apply, which is the last
                 // moment a collection can still be declined; after it,
-                // dispatching is not optional.
+                // dispatching is not optional. For the same reason nothing in
+                // this loop may return before the dispatches below: each list
+                // behind this one, each conflict set aside and the apply error
+                // hold mutations behind a cursor that has moved.
 
                 if let Some(ref error) = list.error {
-                    let has_baseline =
-                        if matches!(error, CollectionSyncError::Conflict { has_more: false }) {
-                            backend
-                                .get_version(name.as_str())
-                                .await?
-                                .is_some_and(|state| state.has_baseline())
-                        } else {
-                            false
-                        };
-                    match CollectionDisposition::from_error(error, has_baseline) {
+                    // A list the server answered with an error comes back from
+                    // the apply with the version the store held for it (the
+                    // default where it held none, which has no baseline): a
+                    // conflict that is current is judged on that, with no
+                    // second read.
+                    match CollectionDisposition::from_error(error, new_state.has_baseline()) {
                         CollectionDisposition::Refetch => {
                             warn!(target: "Client/AppState", "Collection {name:?} conflict has more pages; refetching");
                             needs_refetch.push(name);
@@ -2468,6 +2486,16 @@ impl Client {
                     "Batched sync: {:?} done (version={}, has_more={})",
                     name, new_state.version, list.has_more_patches
                 );
+            }
+
+            // The primary is asked for nothing here: the collection is not
+            // broken, only moved.
+            for (name, error) in conflicts {
+                let full_sync = replaying_snapshot.contains(&name);
+                self.dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                    .await;
+                answered.insert(name);
+                outcome.retryable.push(name);
             }
 
             // Anything asked for that the response did not mention is not synced
