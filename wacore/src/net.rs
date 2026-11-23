@@ -102,6 +102,9 @@ pub enum DisconnectReason {
     /// Local primary app-state initialization failed after authentication.
     /// The connection may be retried once its backend or key material recovers.
     PrimaryAppStateInitializationFailed,
+    /// The host refused the connection's offline backlog before any of it was
+    /// handled. The server keeps it for the next connection, which asks again.
+    OfflineAdmissionRefused,
     /// The reason was not reported by this transport (e.g. local shutdown).
     Unknown,
 }
@@ -120,6 +123,7 @@ impl std::fmt::Display for DisconnectReason {
             Self::PrimaryAppStateInitializationFailed => {
                 write!(f, "primary app-state initialization failed")
             }
+            Self::OfflineAdmissionRefused => write!(f, "offline backlog refused by the host"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -143,6 +147,8 @@ impl DisconnectReason {
             Self::ServerClose { code, .. } => matches!(code, None | Some(1000) | Some(1001)),
             // A transport read/IO error is a real failure — never quiet.
             Self::ReadError(_) | Self::PrimaryAppStateInitializationFailed => false,
+            // The host's own failure, reported loudly where it refused.
+            Self::OfflineAdmissionRefused => false,
             // Unknown reason: stay loud, don't assume it was benign.
             Self::Unknown => false,
         }

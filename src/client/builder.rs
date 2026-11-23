@@ -26,6 +26,7 @@ use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHoo
 use crate::types::enc_handler::EncHandler;
 use crate::types::group_notification_durability::GroupNotificationDurabilityHook;
 use crate::types::history_sync_admission::HistorySyncAdmission;
+use crate::types::offline_admission::OfflineAdmissionHook;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::iq::abprops::AbProp;
 use wacore::runtime::Runtime;
@@ -463,6 +464,24 @@ impl ClientBuilder {
         hook: Arc<dyn AppStateDurabilityHook>,
     ) -> Self {
         self.extensions_mut().app_state_durability_hook = Some(hook);
+        self
+    }
+
+    /// Commit what the host records of a catch-up before any of a connection's
+    /// offline backlog is asked for or handled. See [`OfflineAdmissionHook`]
+    /// for what waits, its bound and what a refusal does.
+    pub fn with_offline_admission_hook<Oh>(mut self, hook: Oh) -> Self
+    where
+        Oh: OfflineAdmissionHook + 'static,
+    {
+        self.extensions_mut().offline_admission_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register an already-shared offline admission hook. The last
+    /// registration wins.
+    pub fn with_offline_admission_hook_arc(mut self, hook: Arc<dyn OfflineAdmissionHook>) -> Self {
+        self.extensions_mut().offline_admission_hook = Some(hook);
         self
     }
 
@@ -1191,6 +1210,7 @@ pub(super) struct ClientExtensions {
     pub(super) history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
     pub(super) group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     pub(super) app_state_durability_hook: Option<Arc<dyn AppStateDurabilityHook>>,
+    pub(super) offline_admission_hook: Option<Arc<dyn OfflineAdmissionHook>>,
     pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
     pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
     pub(super) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,

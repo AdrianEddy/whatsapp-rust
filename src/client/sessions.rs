@@ -591,22 +591,24 @@ impl Client {
     }
 
     pub(crate) async fn wait_for_offline_delivery_end_with_timeout(&self, timeout: Duration) {
-        /// Why the wait ended, when it did not run out of time.
+        use super::offline_resume::Admission;
+
+        /// Why one turn of the wait ended.
         enum Wake {
             /// The offline sync signalled completion.
             Sync,
             /// The connection this wait belongs to ended under it.
             ConnectionEnded,
+            /// The host's admission of the backlog moved.
+            Admission,
+            /// A whole window of the server's silence went by.
+            Expired,
         }
 
         let wait_generation = self.connection_generation.load(Ordering::Acquire);
         // Subscribed before the completion check, so a teardown landing in the
         // window between the two still wakes this wait.
         let shutdown = self.connection_shutdown_signal();
-        let offline_fut = self.offline_sync_notifier.listen();
-        if self.offline_sync_completed.load(Ordering::Relaxed) {
-            return;
-        }
 
         // Raced against the per-connection shutdown, because every caller of
         // this helper is doing something for *this* connection — the post-login
@@ -620,56 +622,105 @@ impl Client {
         // is a claim about a live connection's backlog, and the timeout path
         // below is the only place entitled to make it (behind the same
         // generation guard it always had).
-        let waited = wacore::runtime::timeout(&*self.runtime, timeout, async {
-            futures::select! {
-                _ = offline_fut.fuse() => Wake::Sync,
-                _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => Wake::ConnectionEnded,
-            }
-        })
-        .await;
-
-        match waited {
-            Ok(Wake::Sync) => return,
-            Ok(Wake::ConnectionEnded) => {
-                log::debug!(
-                    target: "Client/OfflineSync",
-                    "Offline sync wait ended with its connection (generation {} -> {}); leaving the sync uncompleted",
-                    wait_generation,
-                    self.connection_generation.load(Ordering::Acquire),
-                );
+        //
+        // The limit is the server's silence, so it runs only while the server
+        // has been asked for the backlog: a window starts with this wait and
+        // again at the host's answer to the admission, and none runs while
+        // the host's call is out (`crate::OfflineAdmissionHook`). The drain is
+        // ended here only by closing the admission from where the window found
+        // it, so never with the call out, and a host is not asked on a
+        // connection whose drain this ended.
+        let mut window = None;
+        let mut answered = false;
+        let closed_here = loop {
+            // Both listeners before the reads they answer, so neither a
+            // completion nor a move of the admission in between is missed.
+            let moved = self.offline_batch.listen_admission();
+            let offline_fut = self.offline_sync_notifier.listen();
+            if self.offline_sync_completed.load(Ordering::Relaxed) {
                 return;
             }
-            Err(_) => {}
-        }
-
-        // Guard: don't complete sync for a stale connection generation.
-        // A reconnect may have happened while we were waiting, making this
-        // timeout belong to the old connection.
-        if self.connection_generation.load(Ordering::Acquire) != wait_generation
-            || self.expected_session_disconnect(Ordering::Relaxed)
-        {
-            log::debug!(
-                target: "Client/OfflineSync",
-                "Offline sync timeout ignored: connection generation changed or disconnected",
-            );
-            return;
-        }
+            let admission = self.offline_batch.admission(wait_generation);
+            match admission {
+                // Another wait of this connection ended the drain: join it.
+                Some(Admission::Closed) => break false,
+                Some(Admission::Asked) => window = None,
+                _ => {
+                    // The answer starts a window of its own, however far the
+                    // running one had got.
+                    let answer = admission == Some(Admission::Answered)
+                        && !std::mem::replace(&mut answered, true);
+                    if answer || window.is_none() {
+                        window = Some(self.runtime.sleep(timeout));
+                    }
+                }
+            }
+            let expiry = async {
+                match window.as_mut() {
+                    Some(running) => running.await,
+                    None => std::future::pending().await,
+                }
+            };
+            let wake = futures::select! {
+                _ = offline_fut.fuse() => Wake::Sync,
+                _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => Wake::ConnectionEnded,
+                _ = moved.fuse() => Wake::Admission,
+                _ = expiry.fuse() => Wake::Expired,
+            };
+            match wake {
+                Wake::Sync => return,
+                Wake::ConnectionEnded => {
+                    log::debug!(
+                        target: "Client/OfflineSync",
+                        "Offline sync wait ended with its connection (generation {} -> {}); leaving the sync uncompleted",
+                        wait_generation,
+                        self.connection_generation.load(Ordering::Acquire),
+                    );
+                    return;
+                }
+                Wake::Admission => {}
+                Wake::Expired => {
+                    window = None;
+                    // Guard: don't complete sync for a stale connection generation.
+                    // A reconnect may have happened while we were waiting, making this
+                    // timeout belong to the old connection.
+                    if self.connection_generation.load(Ordering::Acquire) != wait_generation
+                        || self.expected_session_disconnect(Ordering::Relaxed)
+                    {
+                        log::debug!(
+                            target: "Client/OfflineSync",
+                            "Offline sync timeout ignored: connection generation changed or disconnected",
+                        );
+                        return;
+                    }
+                    // Otherwise the host was asked since the window began:
+                    // look again.
+                    if let Some(seen) = admission
+                        && self.offline_batch.close_admission(wait_generation, seen)
+                    {
+                        break true;
+                    }
+                }
+            }
+        };
 
         let processed = self
             .offline_sync_metrics
             .processed_messages
             .load(Ordering::Acquire);
-        let expected = self
-            .offline_sync_metrics
-            .total_messages
-            .load(Ordering::Acquire);
-        log::warn!(
-            target: "Client/OfflineSync",
-            "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
-            timeout,
-            processed,
-            expected,
-        );
+        if closed_here {
+            let expected = self
+                .offline_sync_metrics
+                .total_messages
+                .load(Ordering::Acquire);
+            log::warn!(
+                target: "Client/OfflineSync",
+                "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
+                timeout,
+                processed,
+                expected,
+            );
+        }
         self.complete_offline_sync_for_generation(
             i32::try_from(processed).unwrap_or(i32::MAX),
             wait_generation,

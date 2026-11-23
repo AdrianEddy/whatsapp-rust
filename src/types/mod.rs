@@ -12,4 +12,5 @@ pub mod group_notification_durability;
 pub mod group_notification_facts;
 pub mod history_sync_admission;
 pub mod history_sync_durability;
+pub mod offline_admission;
 pub mod retry_admission;

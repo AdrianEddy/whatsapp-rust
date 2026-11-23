@@ -3833,6 +3833,8 @@ fn client_size_pins_runtime_cache_config_saving() {
     // The app-state durability hook is fixed at assembly, so it has no cell:
     // one optional shared pointer, counted from its representation.
     expected += size_of::<Option<Arc<dyn crate::AppStateDurabilityHook>>>();
+    // So is the offline admission hook.
+    expected += size_of::<Option<Arc<dyn crate::OfflineAdmissionHook>>>();
     #[cfg(feature = "generated-group-notifications")]
     {
         // Contextual group parsing retains its own immutable provider cell.

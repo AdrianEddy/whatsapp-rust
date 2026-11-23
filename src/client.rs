@@ -35,6 +35,7 @@ mod node_io;
 pub(crate) use node_io::PermitSuspension;
 mod notification_scope;
 pub(crate) use notification_scope::NotificationScope;
+mod offline_admission;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod session_state;
@@ -2490,6 +2491,10 @@ pub struct Client {
     /// Optional app-state commit before each cursor moves, fixed during
     /// assembly; the app-state processor takes it when it is first built.
     pub(crate) app_state_durability_hook: Option<Arc<dyn crate::AppStateDurabilityHook>>,
+
+    /// Optional host commit before a connection's offline backlog is asked for
+    /// or handled, fixed during assembly; each read loop takes it once.
+    pub(crate) offline_admission_hook: Option<Arc<dyn crate::OfflineAdmissionHook>>,
 
     /// Optional retry admission, fixed during assembly.
     pub(crate) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,

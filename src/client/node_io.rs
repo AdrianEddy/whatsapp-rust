@@ -1,6 +1,7 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
 use super::lifecycle::{ConflictKind, ProtocolTerminalReason};
+use super::offline_admission::OfflineGate;
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter, StreamedResponse};
 use wacore::net::DisconnectReason;
@@ -45,6 +46,8 @@ pub(crate) enum ReadLoopError {
     Transport(DisconnectReason),
     #[error("transport event channel closed")]
     ChannelClosed,
+    #[error("the host refused the offline backlog")]
+    OfflineAdmissionRefused,
 }
 
 impl ReadLoopError {
@@ -53,6 +56,7 @@ impl ReadLoopError {
     pub(crate) fn into_reason(self) -> DisconnectReason {
         match self {
             Self::Transport(reason) => reason,
+            Self::OfflineAdmissionRefused => DisconnectReason::OfflineAdmissionRefused,
             Self::NotStarted(_) | Self::ChannelClosed => DisconnectReason::Unknown,
         }
     }
@@ -388,14 +392,41 @@ impl Client {
         // listener still catches an in-loop firing.
         let shutdown_fut = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
         futures::pin_mut!(shutdown_fut);
+        let mut offline = OfflineGate::new(self);
 
         loop {
+            let reads = offline.reads();
+            let next_event = async {
+                if !reads {
+                    std::future::pending::<()>().await;
+                }
+                transport_events.recv().await
+            };
             futures::select_biased! {
                     _ = shutdown_fut => {
                         debug!("Shutdown signaled in message loop. Exiting message loop.");
                         return Ok(ReadLoopExit::Expected);
                     },
-                    event_result = transport_events.recv().fuse() => {
+                    verdict = offline.verdict().fuse() => {
+                        let held = match verdict {
+                            Ok(held) => held,
+                            Err(error) => {
+                                warn!("Offline backlog refused by the host, ending the connection: {error:#}");
+                                return Err(ReadLoopError::OfflineAdmissionRefused);
+                            }
+                        };
+                        for (processed, node) in (1u32..).zip(held) {
+                            if self.process_read_node(node, &shutdown).await {
+                                return Ok(ReadLoopExit::Expected);
+                            }
+                            if processed.is_multiple_of(self.runtime.yield_frequency())
+                                && let Some(yield_fut) = self.runtime.yield_now()
+                            {
+                                yield_fut.await;
+                            }
+                        }
+                    },
+                    event_result = next_event.fuse() => {
                         match event_result {
                             Ok(crate::transport::TransportEvent::DataReceived(data)) => {
                                 // Update dead-socket timer (WA Web: deadSocketTimer reset)
@@ -414,20 +445,16 @@ impl Client {
 
                                 while let Some(encrypted_frame) = frame_decoder.decode_frame() {
                                     // Decrypt the frame synchronously (required for noise counter ordering)
-                                    if let Some(node) = self.decrypt_frame(&noise_socket, encrypted_frame) {
-                                        if self.processes_inline(node.get()) {
-                                            self.process_decrypted_node_scoped(node, &shutdown).await;
-                                        } else {
-                                            let client = self.clone();
-                                            let shutdown = shutdown.clone();
-                                            self.runtime.spawn_detached(Box::pin(async move {
-                                                client.process_decrypted_node_scoped(node, &shutdown).await;
-                                            }));
-                                        }
-                                    }
+                                    let node = self
+                                        .decrypt_frame(&noise_socket, encrypted_frame)
+                                        .and_then(|node| offline.pass(node));
+                                    let over = match node {
+                                        Some(node) => self.process_read_node(node, &shutdown).await,
+                                        None => self.read_loop_over(&shutdown),
+                                    };
 
                                     // Check if we should exit after processing (e.g., after 515 stream error)
-                                    if shutdown.is_fired() || self.expected_session_disconnect(Ordering::Relaxed) {
+                                    if over {
                                         debug!("Expected disconnect signaled during frame processing. Exiting message loop.");
                                         // The batch (this frame included — its counter
                                         // increment is below) must not vanish from the
@@ -488,6 +515,30 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Process a node the read loop read, on the loop or in a task of its own
+    /// ([`Self::processes_inline`]), and say whether the loop is over after it.
+    async fn process_read_node(
+        self: &Arc<Self>,
+        node: wacore_binary::OwnedNodeRef,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) -> bool {
+        if self.processes_inline(node.get()) {
+            self.process_decrypted_node_scoped(node, shutdown).await;
+        } else {
+            let client = self.clone();
+            let shutdown = shutdown.clone();
+            self.runtime.spawn_detached(Box::pin(async move {
+                client.process_decrypted_node_scoped(node, &shutdown).await;
+            }));
+        }
+        self.read_loop_over(shutdown)
+    }
+
+    /// Whether what the read loop processed ended its connection.
+    fn read_loop_over(&self, shutdown: &wacore::runtime::ShutdownSignal) -> bool {
+        shutdown.is_fired() || self.expected_session_disconnect(Ordering::Relaxed)
     }
 
     /// Decrypt a frame and return the parsed node as a zero-copy OwnedNodeRef.

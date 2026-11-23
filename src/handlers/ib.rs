@@ -210,32 +210,25 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 }
             }
             InfoBulletinType::OfflinePreview => {
-                let mut attrs = child.attrs();
-                let total = attrs.optional_u64("count").unwrap_or(0) as i32;
-                let app_data_changes = attrs.optional_u64("appdata").unwrap_or(0) as i32;
-                let messages = attrs.optional_u64("message").unwrap_or(0) as i32;
-                let notifications = attrs.optional_u64("notification").unwrap_or(0) as i32;
-                let receipts = attrs.optional_u64("receipt").unwrap_or(0) as i32;
-                let calls = attrs.optional_u64("call").unwrap_or(0) as i32;
-                let statuses = attrs.optional_u64("status").unwrap_or(0) as i32;
+                let preview = offline_preview(child);
+                let total = preview.total;
 
                 debug!(
                     target: "Client/OfflineSync",
                     "Offline preview: {} total ({} messages, {} statuses, {} notifications, {} receipts, {} calls, {} app data changes)",
-                    total, messages, statuses, notifications, receipts, calls, app_data_changes,
+                    total,
+                    preview.messages,
+                    preview.statuses,
+                    preview.notifications,
+                    preview.receipts,
+                    preview.calls,
+                    preview.app_data_changes,
                 );
 
-                client.core.event_bus.dispatch(Event::OfflineSyncPreview(
-                    OfflineSyncPreview::builder()
-                        .total(total)
-                        .app_data_changes(app_data_changes)
-                        .messages(messages)
-                        .notifications(notifications)
-                        .receipts(receipts)
-                        .calls(calls)
-                        .statuses(statuses)
-                        .build(),
-                ));
+                client
+                    .core
+                    .event_bus
+                    .dispatch(Event::OfflineSyncPreview(preview));
 
                 // Drive pull-based delivery: without this the server stops
                 // after the ~5-stanza primer and the rest of the backlog is
@@ -318,6 +311,20 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
             }
         }
     }
+}
+
+/// The counts an `<offline_preview>` announces.
+pub(crate) fn offline_preview(child: &wacore_binary::NodeRef<'_>) -> OfflineSyncPreview {
+    let mut attrs = child.attrs();
+    OfflineSyncPreview::builder()
+        .total(attrs.optional_u64("count").unwrap_or(0) as i32)
+        .app_data_changes(attrs.optional_u64("appdata").unwrap_or(0) as i32)
+        .messages(attrs.optional_u64("message").unwrap_or(0) as i32)
+        .notifications(attrs.optional_u64("notification").unwrap_or(0) as i32)
+        .receipts(attrs.optional_u64("receipt").unwrap_or(0) as i32)
+        .calls(attrs.optional_u64("call").unwrap_or(0) as i32)
+        .statuses(attrs.optional_u64("status").unwrap_or(0) as i32)
+        .build()
 }
 
 const WARNED_TOS: u8 = 1;

@@ -519,6 +519,7 @@ pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
 pub use types::history_sync_durability::{HistorySyncDurabilityHook, HistorySyncKey};
+pub use types::offline_admission::OfflineAdmissionHook;
 pub use types::retry_admission::{RetryAdmission, RetryContext, RetryDecision};
 pub mod download;
 pub mod error;

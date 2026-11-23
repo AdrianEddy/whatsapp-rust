@@ -12,6 +12,9 @@
 //! | App-state patches, snapshots and recoveries | [`crate::AppStateDurabilityHook`], before the cursor moves |
 //! | Callbacks/event subscriptions | Observers, not durable capture |
 //!
+//! A connection's offline backlog as a whole is admitted first, before any of
+//! it is asked for or handled: [`crate::OfflineAdmissionHook`].
+//!
 //! Each hook defines its own idempotence, cancellation and replay limits.
 //! Withholding an ACK/receipt does not promise indefinite retention or redelivery.
 

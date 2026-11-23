@@ -17,6 +17,7 @@ use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscr
 use crate::types::group_notification_durability::GroupNotificationDurabilityHook;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
+use crate::types::offline_admission::OfflineAdmissionHook;
 use log::{info, warn};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -1329,6 +1330,24 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         hook: Arc<dyn AppStateDurabilityHook>,
     ) -> Self {
         self.client_builder = self.client_builder.with_app_state_durability_hook_arc(hook);
+        self
+    }
+
+    /// Commit what the host records of a catch-up before any of a connection's
+    /// offline backlog is asked for or handled. See [`OfflineAdmissionHook`]
+    /// for what waits, its bound and what a refusal does.
+    pub fn with_offline_admission_hook<Oh>(mut self, hook: Oh) -> Self
+    where
+        Oh: OfflineAdmissionHook + 'static,
+    {
+        self.client_builder = self.client_builder.with_offline_admission_hook(hook);
+        self
+    }
+
+    /// Register an already-shared offline admission hook. The last
+    /// registration wins.
+    pub fn with_offline_admission_hook_arc(mut self, hook: Arc<dyn OfflineAdmissionHook>) -> Self {
+        self.client_builder = self.client_builder.with_offline_admission_hook_arc(hook);
         self
     }
 

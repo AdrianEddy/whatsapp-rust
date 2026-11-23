@@ -51,9 +51,54 @@ const STANZA_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// so a stanza racing that decision loses the CAS instead of being ignored.
 const INACTIVE_CLAIMED: u64 = u64::MAX;
 
+/// Where the host's admission of one connection's offline backlog stands
+/// ([`crate::OfflineAdmissionHook`]). It only moves forward: `Unasked` to
+/// `Asked` to `Answered`, and to `Closed` from `Unasked` or `Answered`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    /// The host has not been asked.
+    Unasked = 0,
+    /// The host's call is out. Nothing is asked of the server meanwhile, so
+    /// its silence says nothing of the drain.
+    Asked = 1,
+    /// The host answered, or its call was dropped with its connection.
+    Answered = 2,
+    /// The client ended the drain by itself: the host is not asked on this
+    /// connection, and what reaches it later is live.
+    Closed = 3,
+}
+
+impl Admission {
+    const ALL: [Self; 4] = [Self::Unasked, Self::Asked, Self::Answered, Self::Closed];
+
+    /// `self` for connection `generation`, in one word: the generation above
+    /// the phase's two bits (generations count up from one, nowhere near
+    /// 2^62). A connection's moves raise the word, and so does a newer
+    /// connection's first, so it only ever grows.
+    fn packed(self, generation: u64) -> u64 {
+        (generation << 2) | self as u64
+    }
+
+    /// Where connection `generation`'s admission stands in `word`: what an
+    /// older connection left reads as `Unasked`, and `None` once a newer one
+    /// has moved it.
+    fn of(word: u64, generation: u64) -> Option<Self> {
+        match (word >> 2).cmp(&generation) {
+            std::cmp::Ordering::Less => Some(Self::Unasked),
+            std::cmp::Ordering::Equal => Some(Self::ALL[(word & 3) as usize]),
+            std::cmp::Ordering::Greater => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OfflineBatchCoordinator {
     armed: AtomicBool,
+    /// The connection's [`Admission`], packed with its generation so that
+    /// each move is one compare-exchange and no connection moves another's.
+    admission: AtomicU64,
+    /// Notified on every move of `admission`.
+    admission_moved: event_listener::Event,
     /// Pacing owned by the armed generation. `arm` swaps a fresh object in and
     /// `reset` takes it out, so a guard or arrival retired by a reconnect can
     /// only ever reach the object it was minted with.
@@ -79,6 +124,65 @@ impl OfflineBatchCoordinator {
     /// silent.
     pub(crate) fn take_armed(&self) -> bool {
         self.armed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Where connection `generation`'s admission stands; `None` once a newer
+    /// connection has moved it.
+    pub(super) fn admission(&self, generation: u64) -> Option<Admission> {
+        Admission::of(self.admission.load(Ordering::Acquire), generation)
+    }
+
+    /// The next move of any connection's admission. Taken before
+    /// [`admission`](Self::admission) is read, so a move in between wakes it.
+    pub(super) fn listen_admission(&self) -> event_listener::EventListener {
+        self.admission_moved.listen()
+    }
+
+    /// The gate's ask for connection `generation`: whether the host is to be
+    /// asked now. Never once the client has ended that connection's drain by
+    /// itself, nor twice.
+    pub(super) fn ask_admission(&self, generation: u64) -> bool {
+        self.move_admission(generation, Admission::Unasked, Admission::Asked)
+    }
+
+    /// The host's call for connection `generation` has returned, or was
+    /// dropped.
+    pub(super) fn answer_admission(&self, generation: u64) {
+        self.move_admission(generation, Admission::Asked, Admission::Answered);
+    }
+
+    /// The client ends connection `generation`'s drain by itself, from `seen`,
+    /// the admission as a window of the server's silence found it at its start.
+    /// Only if it still stands there: an ask since then, answered or not, keeps
+    /// the drain open, so it is never ended while the host's call is out, and
+    /// once it is, no host is asked on that connection.
+    pub(super) fn close_admission(&self, generation: u64, seen: Admission) -> bool {
+        matches!(seen, Admission::Unasked | Admission::Answered)
+            && self.move_admission(generation, seen, Admission::Closed)
+    }
+
+    /// Moves connection `generation`'s admission from `from` to `to`, if that
+    /// is where it stands, and wakes whoever listens. A failed compare-exchange
+    /// is tried again while `from` still stands (a spurious failure, or an
+    /// older connection's leftover moving beneath it); any other move made it
+    /// stale.
+    fn move_admission(&self, generation: u64, from: Admission, to: Admission) -> bool {
+        let mut word = self.admission.load(Ordering::Acquire);
+        while Admission::of(word, generation) == Some(from) {
+            match self.admission.compare_exchange_weak(
+                word,
+                to.packed(generation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.admission_moved.notify(usize::MAX);
+                    return true;
+                }
+                Err(actual) => word = actual,
+            }
+        }
+        false
     }
 
     #[cfg(test)]

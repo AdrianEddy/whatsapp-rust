@@ -531,6 +531,7 @@ impl Client {
             history_sync_durability_hook,
             group_notification_durability_hook,
             app_state_durability_hook,
+            offline_admission_hook,
             custom_enc_handlers,
             retry_admission,
             decrypt_failure_admission,
@@ -776,6 +777,7 @@ impl Client {
             #[cfg(feature = "generated-group-notifications")]
             group_notification_facts_provider: std::sync::OnceLock::new(),
             app_state_durability_hook,
+            offline_admission_hook,
             retry_admission,
             decrypt_failure_admission,
             history_sync_admission,
