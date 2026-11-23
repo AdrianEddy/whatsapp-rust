@@ -1745,7 +1745,6 @@ impl ResponseWaiterMap {
         self.stream_waiters.store(0, Ordering::Release);
     }
 
-    #[cfg(test)]
     pub(crate) fn contains_key(&self, request_id: &str) -> bool {
         self.entries.get(request_id).is_some()
     }

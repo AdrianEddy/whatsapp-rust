@@ -807,7 +807,8 @@ impl Client {
         // Per-connection: pending IQ requests are bound to the current socket;
         // a reconnect aborts them (sender retries on the new connection).
         // Subscribed before the send so a shutdown during it is not missed.
-        let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
+        let connection = self.connection_shutdown_signal();
+        let shutdown = wacore::runtime::wait_for_shutdown(&connection);
         // The deadline covers the send as well as the answer. A write into a
         // socket that stays established but no longer drains (a laptop that
         // resumed from suspend, a network that changed underneath it) never
@@ -822,11 +823,29 @@ impl Client {
             let exchange = self
                 .register_and_send(req_id, send_fn, on_sent, waiter)
                 .await?;
-            let response = rx.await.map_err(|_| IqError::InternalChannelClosed)?;
+            // A waiter dropped unanswered after its connection's signal fired
+            // is the connection's cleanup ending it: nothing answered, and the
+            // connection is gone. One dropped while the connection lives is a
+            // fault of this client's own.
+            let response = rx.await.map_err(|_| {
+                if connection.is_fired() {
+                    IqError::NotConnected
+                } else {
+                    IqError::InternalChannelClosed
+                }
+            })?;
             Ok(exchange.response(response).into_response())
         });
 
-        futures::select! {
+        // Biased, the exchange first: an answer the read loop has delivered is
+        // the answer, whatever ended the connection behind it. The server can
+        // answer an IQ and end the stream in one flight (it does for the
+        // `remove-companion-device` a logout sends), and an unbiased race
+        // would then report `NotConnected` for a request it granted. The read
+        // loop keeps its half of this in `Client::processes_inline`. A request
+        // nothing answered reads `NotConnected` from either arm: the exchange's,
+        // once the connection's cleanup has dropped its waiter, says so too.
+        futures::select_biased! {
             result = rt_timeout(&*self.runtime, timeout, exchange).fuse() => {
                 result.unwrap_or(Err(IqError::Timeout))
             }
@@ -1384,3 +1403,6 @@ mod tests {
 
 #[cfg(all(test, feature = "tracing"))]
 pub(crate) mod tracing_tests;
+
+#[cfg(test)]
+mod mc_tests;

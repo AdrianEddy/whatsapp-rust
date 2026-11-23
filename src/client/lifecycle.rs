@@ -2637,8 +2637,9 @@ impl Client {
         if self.history_sync_durability_hook.get().is_none() {
             self.history_sync_activity.reset();
         }
-        // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
-        // instead of hanging until the 75s timeout.
+        // Drain all pending IQ waiters so they fail fast instead of hanging until
+        // the 75s timeout. The connection's signal fired above, so an IQ's wait
+        // (`send_and_wait_for`) reads a waiter dropped here as NotConnected.
         // Scoped so the sync guard is dropped before the awaits below (a
         // std::sync::MutexGuard held across an await would make this future !Send).
         let waiter_count = {

@@ -103,6 +103,15 @@ fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
     ) || (node.tag.as_ref() == StanzaTag::Iq.as_str() && is_ping_request(node))
 }
 
+/// Whether an `<iq>` answers a request rather than making one.
+///
+/// WAComms.be correlates result/error only. An inbound get/set may use the same
+/// ID as an outstanding request without being its response.
+fn is_iq_response(node: &wacore_binary::NodeRef<'_>) -> bool {
+    node.get_attr("type")
+        .is_some_and(|kind| matches!(kind.as_str().as_ref(), "result" | "error"))
+}
+
 /// A server-initiated ping, which this client owes a pong.
 ///
 /// Type-agnostic on an absent type, like WA Web's `handleIq`, but never a
@@ -815,14 +824,8 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
-        // WAComms.be correlates result/error only. An inbound get/set may use
-        // the same ID as an outstanding request without being its response.
         if tag == Some(StanzaTag::Iq)
-            && nr
-                .get_attr("type")
-                .is_some_and(|kind| matches!(kind.as_str().as_ref(), "result" | "error"))
-            && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
-            && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
+            && let Some(waiter) = self.take_iq_waiter(nr)
         {
             // An IQ id never carries a phash waiter (those are registered under
             // message ids), so a mismatch here means the id space collided.
@@ -1068,7 +1071,10 @@ impl Client {
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
     /// arrives. message and status@broadcast only enqueue here, and a spawned
     /// enqueue could put a group message ahead of the pkmsg that establishes its
-    /// session. Acks and receipts qualify only while nothing observes them.
+    /// session. Acks and receipts qualify only while nothing observes them. The
+    /// answer to a pending IQ only resolves its waiter here, and has to before
+    /// the next frame is read: a spawned one is dropped when that frame ends
+    /// the connection, though the server had answered.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(
@@ -1079,6 +1085,7 @@ impl Client {
                 | StanzaTag::InfoBanner,
             ) => true,
             Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Iq) => self.answers_pending_iq(node),
             Ok(StanzaTag::Notification) => self.queues_group_notification(node),
             Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
@@ -1097,6 +1104,30 @@ impl Client {
             }
             _ => false,
         }
+    }
+
+    /// Whether this `<iq>` answers a request that still waits. One that answers
+    /// nothing goes through the handlers, which may wait on the socket.
+    fn answers_pending_iq(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        is_iq_response(node)
+            && node.get_attr("id").is_some_and(|id| {
+                self.response_waiters_guard()
+                    .contains_key(id.as_str().as_ref())
+            })
+    }
+
+    /// The waiter this `<iq>` answers, taken out of the map. The map is
+    /// unlocked again when this returns, so what the caller then runs with the
+    /// waiter (`subsystem::on_response`, the send, a streamed request's sink
+    /// decoding the stanza) never holds up a registration or another answer.
+    /// A `let` in an `if` condition would keep the lock to the end of the
+    /// branch.
+    fn take_iq_waiter(&self, node: &wacore_binary::NodeRef<'_>) -> Option<ResponseWaiter> {
+        if !is_iq_response(node) {
+            return None;
+        }
+        let id = node.get_attr("id")?;
+        self.response_waiters_guard().remove(id.as_str().as_ref())
     }
 
     /// Answering nothing leaves the stanza in the offline queue forever, which
@@ -4058,9 +4089,8 @@ mod tests {
             }
 
             /// Start the read loop and feed it one response frame. The loop
-            /// keeps running until [`Self::close`]: a close sent right behind
-            /// the frame would tear the waiter map down under a response
-            /// still being processed off the loop.
+            /// keeps running until [`Self::close`]: a response with a close
+            /// right behind it is `request/mc_tests.rs`'s.
             async fn deliver(&self, packed: Vec<u8>) -> tokio::task::JoinHandle<()> {
                 let client = Arc::clone(&self.client);
                 let reader = tokio::spawn(async move {
