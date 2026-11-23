@@ -1,7 +1,7 @@
 use crate::http::{HTTP_STATUS_REDIRECTION_START, HttpClient, HttpRequest};
 use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use log::debug;
 use std::sync::Arc;
 use wacore::types::events::{AppVersionFallback, AppVersionFallbackReason};
@@ -93,10 +93,12 @@ pub async fn fetch_latest_app_version(
     for (key, value) in source.headers {
         request = request.with_header(*key, *value);
     }
+    // Wrapped, not reformatted: the HTTP client's own error is what tells a
+    // caller how the source was out of reach (see `resolve_version_with_runtime`).
     let response = http_client
         .execute(request)
         .await
-        .map_err(|e| anyhow!("HTTP request to {} failed: {}", source.url, e))?;
+        .with_context(|| format!("HTTP request to {} failed", source.url))?;
 
     // `HttpClient` returns a non-2xx as a response, so name the status here
     // instead of letting an error page fall through to a parse failure.
@@ -126,10 +128,29 @@ pub async fn fetch_latest_app_version(
 }
 
 /// A source that answered but did not carry the version where it should be.
-/// Typed so the resolution can tell it from a source it never reached: one is
-/// routine, the other is the source having changed shape.
+/// Typed so the resolution, and a caller, can tell it from a source it never
+/// reached: one is routine, the other is the source having changed shape,
+/// which the next connect will not find otherwise.
+///
+/// A fetch that fails this way carries it in its error chain, and so does the
+/// [`ConnectError::Version`](crate::ConnectError::Version) of the connect it
+/// was for:
+///
+/// ```
+/// use whatsapp_rust::ErrorChainExt;
+/// use whatsapp_rust::version::VersionShapeError;
+///
+/// fn changed_shape(error: &whatsapp_rust::ConnectError) -> bool {
+///     error.sources().any(|cause| cause.is::<VersionShapeError>())
+/// }
+/// ```
+///
+/// A chain without one is a source that was not reached, whose HTTP client's
+/// own error is in the chain, or that answered with an error status
+/// ([`ErrorChainExt::http_status`](crate::ErrorChainExt::http_status)).
 #[derive(Debug, thiserror::Error)]
-enum VersionShapeError {
+#[non_exhaustive]
+pub enum VersionShapeError {
     #[error("could not decode the response body from {url}: {detail}")]
     Body { url: &'static str, detail: String },
     #[error("could not find '{field}' in the response from {url}")]
@@ -543,8 +564,9 @@ mod tests {
         .context("Failed to fetch latest WhatsApp version");
         assert!(bad_body.chain().any(|c| c.is::<VersionShapeError>()));
 
-        let unreachable = anyhow!("HTTP request to https://example.invalid/sdk.js failed: refused")
-            .context("Failed to fetch latest WhatsApp version");
+        let unreachable =
+            anyhow::anyhow!("HTTP request to https://example.invalid/sdk.js failed: refused")
+                .context("Failed to fetch latest WhatsApp version");
         assert!(!unreachable.chain().any(|c| c.is::<VersionShapeError>()));
     }
 
@@ -691,3 +713,6 @@ self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"dynamic_modules\":{\"cr:3
         assert_eq!(parse_sw_js(s), Some((2, 3000, 1026131876)));
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
