@@ -2525,6 +2525,12 @@ pub struct Receipt {
 /// (and, for receipts, [`type`](Self::type)) before correlating ids: a read
 /// receipt carries the id of the message it reads, as that message's delivery
 /// receipt did.
+///
+/// The client dispatches it on the connection's read loop, before it reads the
+/// frame behind the ack, so an ack in the same flight as the frame that ends
+/// the connection still arrives. A handler of this kind runs there, as every
+/// handler runs on the thread that dispatches: it must return promptly, never
+/// block or wait on the client, and hand any slower work to a task of its own.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct ServerAck {

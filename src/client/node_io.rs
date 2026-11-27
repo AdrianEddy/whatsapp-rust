@@ -1122,10 +1122,14 @@ impl Client {
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
     /// arrives. message and status@broadcast only enqueue here, and a spawned
     /// enqueue could put a group message ahead of the pkmsg that establishes its
-    /// session. Acks and receipts qualify only while nothing observes them. The
-    /// answer to a pending IQ only resolves its waiter here, and has to before
-    /// the next frame is read: a spawned one is dropped when that frame ends
-    /// the connection, though the server had answered.
+    /// session. Receipts qualify only while nothing observes them. The answer
+    /// to a pending IQ only resolves its waiter here, and has to before the
+    /// next frame is read: a spawned one is dropped when that frame ends the
+    /// connection, though the server had answered. An ack is the same answer to
+    /// whatever waits for it, a waiter for its id or a `ServerAck` handler, so
+    /// it stays here too; only one a raw-node observer alone wants is spawned.
+    /// A `ServerAck` handler therefore runs on the read loop (the bus dispatches
+    /// synchronously): it has to return promptly, as `Event::ServerAck` says.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(
@@ -1148,13 +1152,23 @@ impl Client {
             }
             Ok(StanzaTag::Ack) => {
                 !self.raw_node_forwarding_enabled()
-                    && !self
+                    || self
                         .core
                         .event_bus
                         .has_handler_for(wacore::types::events::EventKind::ServerAck)
+                    || self.awaits_ack(node)
             }
             _ => false,
         }
+    }
+
+    /// Whether a waiter waits for this `<ack>`'s id: a message send's, a
+    /// group send's phash check.
+    fn awaits_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        node.get_attr("id").is_some_and(|id| {
+            self.response_waiters_guard()
+                .contains_key(id.as_str().as_ref())
+        })
     }
 
     /// Whether this `<iq>` answers a request that still waits. One that answers

@@ -10,6 +10,10 @@
 //! waiter yet (one dropped while the connection lives is the client's own
 //! fault, `InternalChannelClosed`). An answer's waiter runs with the waiter
 //! map unlocked.
+//!
+//! WF24, its twin for acks: an `<ack>` in the flight that ends the stream
+//! reaches what waits for it, a waiter for its id and a `ServerAck` handler,
+//! whatever ended the connection, a raw-node observer beside them or not.
 
 use super::*;
 use crate::client::{DeregistrationOutcome, LogoutReport};
@@ -190,7 +194,11 @@ impl Read {
 
     /// Delivers `answer`, and in the same read what ends the connection.
     async fn deliver(&self, answer: Node, end: End) {
-        let mut nodes = vec![answer];
+        self.deliver_all(vec![answer], end).await;
+    }
+
+    /// Delivers `nodes`, and in the same read what ends the connection.
+    async fn deliver_all(&self, mut nodes: Vec<Node>, end: End) {
         nodes.extend(end.stanza());
         let mut events = vec![TransportEvent::DataReceived(flight(&nodes))];
         if matches!(end, End::Closed) {
@@ -401,4 +409,88 @@ async fn an_answers_waiter_runs_with_the_waiter_map_unlocked() {
         seen.try_recv().expect("the answer reached its waiter"),
         "the waiter ran with the map locked"
     );
+}
+
+/// A message's `<ack>` of `id`, as the server sends it for a send.
+fn message_ack(id: &str) -> Node {
+    NodeBuilder::new("ack")
+        .attr("id", id)
+        .attr("class", "message")
+        .attr("from", "15550000002@s.whatsapp.net")
+        .attr("t", "1720000000")
+        .build()
+}
+
+/// A waiter for the ack of `id`, as a send registers one.
+fn ack_waiter(
+    client: &Client,
+    id: &str,
+) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert(id.to_string(), ResponseWaiter::Iq(sender));
+    receiver
+}
+
+/// The ids of the `ServerAck`s `observer` saw.
+fn acked(observer: &TestEventCollector) -> Vec<String> {
+    observer
+        .events()
+        .iter()
+        .filter_map(|event| match &**event {
+            Event::ServerAck(ack) => Some(ack.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two acks in the flight that ends the stream, one a waiter waits for: with a
+/// `ServerAck` handler subscribed, both reach the handler and the first its
+/// waiter, whatever ended the connection.
+#[tokio::test]
+async fn an_ack_in_the_flight_that_ends_the_stream_reaches_its_waiter_and_handler() {
+    for end in End::ALL {
+        let read = Read::new().await;
+        let observer = Arc::new(TestEventCollector::default());
+        read.client.subscribe_handler(observer.clone()).detach();
+        let waited = ack_waiter(&read.client, "ack-waited");
+        read.deliver_all(
+            vec![message_ack("ack-waited"), message_ack("ack-observed")],
+            end,
+        )
+        .await;
+        let ack = tokio::time::timeout(HANG, waited)
+            .await
+            .expect("the ack reaches its waiter")
+            .unwrap_or_else(|_| panic!("{end:?}: the waiter was dropped unanswered"));
+        assert_eq!(
+            ack.get().get_attr("id").map(|id| id.as_str().into_owned()),
+            Some("ack-waited".to_owned()),
+            "{end:?}"
+        );
+        read.ended().await;
+        assert_eq!(
+            acked(&observer),
+            vec!["ack-waited".to_owned(), "ack-observed".to_owned()],
+            "{end:?}"
+        );
+    }
+}
+
+/// A raw-node observer beside the waiter, and no `ServerAck` handler: the ack is
+/// still its waiter's before the end behind it.
+#[tokio::test]
+async fn an_ack_a_waiter_waits_for_beside_a_raw_observer_reaches_it() {
+    for end in End::ALL {
+        let read = Read::new().await;
+        let _lease = read.client.acquire_raw_node_forwarding();
+        let waited = ack_waiter(&read.client, "ack-waited");
+        read.deliver(message_ack("ack-waited"), end).await;
+        tokio::time::timeout(HANG, waited)
+            .await
+            .expect("the ack reaches its waiter")
+            .unwrap_or_else(|_| panic!("{end:?}: the waiter was dropped unanswered"));
+        read.ended().await;
+    }
 }
