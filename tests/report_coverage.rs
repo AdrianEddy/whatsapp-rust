@@ -138,6 +138,12 @@ const EXEMPT: &[(&str, &str)] = &[
          charging this Arc alias again would double-count the shared table",
     ),
     (
+        "major_sync_task_sender",
+        "a queued history task's tracker holds an `Arc` of the client's own `history_sync_activity` \
+         (its flights map is what the scan reaches), which the report walks; the queued tasks and their \
+         payload bytes are counted there from the moment they are queued (`HistorySyncActivity::begin`)",
+    ),
+    (
         "persistence_manager",
         "holds one live Device and one read snapshot of the fixed-shape persisted record; this \
          guard does not estimate their Vec capacities (edge routing and NCT salt) or closure/lock \

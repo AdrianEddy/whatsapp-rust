@@ -23,6 +23,8 @@ struct RecordingHistory {
     chunk_gate: tokio::sync::Notify,
     backend: Option<Arc<dyn Backend>>,
     require_journal: AtomicBool,
+    /// The worker's chunk failures, as `on_chunk_failed` hears them.
+    failures: Mutex<Vec<(HistorySyncKey, crate::HistoryChunkFailure)>>,
 }
 
 #[async_trait::async_trait]
@@ -108,6 +110,15 @@ impl HistorySyncDurabilityHook for RecordingHistory {
         }
         anyhow::ensure!(self.fail.load(Ordering::SeqCst) != 2, "chunk failure");
         Ok(())
+    }
+
+    async fn on_chunk_failed(
+        &self,
+        key: &HistorySyncKey,
+        _metadata: &HistorySyncMetadata<'_>,
+        failure: crate::HistoryChunkFailure,
+    ) {
+        self.failures.lock().unwrap().push((key.clone(), failure));
     }
 }
 
@@ -1367,3 +1378,6 @@ async fn durable_history_intake_retains_unknown_notification_fields() {
     drop(receiver.recv().await.unwrap());
     history_idle(&client).await;
 }
+
+// WF22: the worker's failures through the hook, and one flight per key.
+mod mc_tests;

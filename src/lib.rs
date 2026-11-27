@@ -518,7 +518,9 @@ pub use types::group_notification_facts::{
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
-pub use types::history_sync_durability::{HistorySyncDurabilityHook, HistorySyncKey};
+pub use types::history_sync_durability::{
+    HistoryChunkFailure, HistorySyncDurabilityHook, HistorySyncKey,
+};
 pub use types::offline_admission::OfflineAdmissionHook;
 pub use types::pair_admission::{PairAdmission, PairCandidate, PairDecision};
 pub use types::retry_admission::{RetryAdmission, RetryContext, RetryDecision};

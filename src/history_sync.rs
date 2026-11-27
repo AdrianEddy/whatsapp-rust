@@ -15,9 +15,11 @@ use wacore::sync_engine::history::{
 };
 use wacore_binary::{Jid, JidExt as _};
 
-use crate::HistorySyncKey;
 use crate::client::Client;
+use crate::sync_task::HistoryClaim;
 use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
+use crate::{HistoryChunkFailure, HistorySyncKey};
+use waproto::whatsapp as wa;
 
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 const INLINE_NOTIFICATION_ENCODING_THRESHOLD: usize = 256 * 1024;
@@ -108,6 +110,95 @@ fn history_sync_metadata<'a>(
             .peer_data_request_session_id
             .as_deref(),
     }
+}
+
+/// The metadata the durability hook takes for a chunk of `notification`.
+fn chunk_metadata(
+    notification: &wa::message::HistorySyncNotification,
+    inline_payload_len: Option<usize>,
+) -> HistorySyncMetadata<'_> {
+    HistorySyncMetadata {
+        sync_type: notification.sync_type.map(|kind| kind as i32),
+        chunk_order: notification.chunk_order,
+        progress: notification.progress,
+        file_length: notification.file_length,
+        inline_payload_len,
+        peer_data_request_session_id: notification.peer_data_request_session_id.as_deref(),
+    }
+}
+
+/// Whose history task this is ([`Client::process_history_sync_task_inner`]): a
+/// durable key's failure reaches the host through its hook from the worker's
+/// task, and as the result of the host's own replay.
+#[derive(Clone, Copy)]
+enum Durability<'a> {
+    /// A session task, with no durable key.
+    None,
+    Worker(&'a HistorySyncKey),
+    Replay(&'a HistorySyncKey),
+}
+
+impl<'a> Durability<'a> {
+    fn key(self) -> Option<&'a HistorySyncKey> {
+        match self {
+            Self::None => None,
+            Self::Worker(key) | Self::Replay(key) => Some(key),
+        }
+    }
+}
+
+/// How a history task ended.
+enum TaskEnd {
+    /// The chunk was captured and parsed.
+    Done,
+    /// The client stopped it.
+    Stopped,
+    /// It gave the chunk up.
+    Failed(HistoryChunkFailure),
+}
+
+/// A download's failure as the chunk's: a blob that can't be had as its
+/// notification references it (the media server's refusal of the reference,
+/// a body that doesn't verify against it, a reference that makes no request,
+/// the download policy's refusal of the blob), or else what a later try can
+/// get past (memory the download couldn't have at the time among it).
+/// Matched exhaustively so a new variant has to be classified here rather
+/// than defaulting to `Network` unnoticed.
+fn download_failure(error: &crate::download::ClientDownloadError) -> HistoryChunkFailure {
+    use crate::download::{
+        ClientDownloadError as E, DownloadPolicyError as P, MediaDecryptionError,
+    };
+    match error {
+        E::ReferenceRejected(_)
+        | E::NoHostsAfterRefresh(_)
+        | E::Preparation(_)
+        | E::ResourcePolicy(P::LimitExceeded { .. } | P::StreamingRequired) => {
+            HistoryChunkFailure::Refused
+        }
+        // Every host failed, the last on a body that fails its MAC, a hash or
+        // its decryption: a later try gets the same bytes.
+        E::HostsUnreachable(cause) if cause.chain().any(|e| e.is::<MediaDecryptionError>()) => {
+            HistoryChunkFailure::Refused
+        }
+        E::HostsUnreachable(_)
+        | E::WriterIo(_)
+        | E::NoHosts
+        | E::MediaSession { .. }
+        | E::ResourcePolicy(P::MemoryBudgetExceeded { .. } | P::AllocationFailed | P::Cancelled) => {
+            HistoryChunkFailure::Network
+        }
+        E::WriterCleanup { failure, .. } => download_failure(failure),
+    }
+}
+
+/// A replay's error for a chunk given up: its failure, in the chain.
+fn chunk_given_up(failure: HistoryChunkFailure) -> anyhow::Error {
+    anyhow::Error::new(failure).context("history sync capture or processing did not complete")
+}
+
+/// A notification that doesn't decode, as a replay's error: malformed.
+fn malformed_notification(error: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+    anyhow::Error::new(error).context(HistoryChunkFailure::Malformed)
 }
 
 /// Immutable seed policy snapshot shared by the streaming filter and the
@@ -342,6 +433,13 @@ impl Client {
     /// identity to be loaded; downloaded chunks also need a connected socket.
     /// Inline payloads can be processed without a socket, but `Ok` only proves
     /// local capture/processing, not receipt delivery or remote acknowledgement.
+    ///
+    /// A replay of a key whose chunk the worker or another replay holds waits
+    /// for that work and answers as it ended, downloading nothing itself: a
+    /// worker task that outlived its connection and the host's replay on the
+    /// next one fetch the chunk once. A chunk given up carries its
+    /// [`HistoryChunkFailure`] in the error's chain, a malformed notification
+    /// included ([`Malformed`](HistoryChunkFailure::Malformed)).
     pub async fn replay_history_sync_notification(
         self: &Arc<Self>,
         key: &HistorySyncKey,
@@ -365,6 +463,35 @@ impl Client {
             "history notification does not belong to this Client account"
         );
         drop(identity);
+        let lease = match self.history_sync_activity.claim(key) {
+            HistoryClaim::Lead(lease) => lease,
+            HistoryClaim::Join(flight) => {
+                return flight.ended().await.map_err(chunk_given_up);
+            }
+        };
+        let result = self.replay_claimed(key, notification).await;
+        // The flight ends as this replay ended, whichever exit it took, so a
+        // joiner answers what the replay answers (a malformed notification
+        // included). An error that names no failure (a stop, the host's own
+        // hook's error) leaves the lease's default, as a cancellation does.
+        match result
+            .as_ref()
+            .map_err(|error| error.downcast_ref::<HistoryChunkFailure>())
+        {
+            Ok(()) => lease.finish(Ok(())),
+            Err(Some(&failure)) => lease.finish(Err(failure)),
+            Err(None) => drop(lease),
+        }
+        result
+    }
+
+    /// [`Self::replay_history_sync_notification`]'s work once it leads `key`'s
+    /// flight: the notification decoded, captured and processed.
+    async fn replay_claimed(
+        self: &Arc<Self>,
+        key: &HistorySyncKey,
+        notification: &[u8],
+    ) -> anyhow::Result<()> {
         // Reserve replay capacity before the shared pool so waiting replays
         // cannot occupy the slot needed to drain the normal sync queue. Both
         // limits precede decoding, whose inline copies belong to our budget.
@@ -406,7 +533,8 @@ impl Client {
             let (tx, rx) = futures::channel::oneshot::channel();
             let work = self.runtime.spawn_blocking(Box::new(move || {
                 let result = waproto::codec::history_sync_notification_decode(&encoded)
-                    .map(DetachedHistorySyncNotification::from);
+                    .map(DetachedHistorySyncNotification::from)
+                    .map_err(malformed_notification);
                 if let Ok(notification) = &result {
                     lease.set_payload_bytes(
                         notification.inline_payload.as_ref().map_or(0, Bytes::len),
@@ -419,7 +547,8 @@ impl Client {
                 .map_err(|_| anyhow::anyhow!("history notification decoder stopped"))??
         } else {
             retained_wire = Bytes::copy_from_slice(notification);
-            let notification = waproto::codec::history_sync_notification_decode(notification)?;
+            let notification = waproto::codec::history_sync_notification_decode(notification)
+                .map_err(malformed_notification)?;
             let notification = DetachedHistorySyncNotification::from(notification);
             tracker.set_payload_bytes(notification.inline_payload.as_ref().map_or(0, Bytes::len));
             notification
@@ -430,17 +559,19 @@ impl Client {
         else {
             return Ok(());
         };
-        anyhow::ensure!(
-            self.process_history_sync_task_inner(
+        match self
+            .process_history_sync_task_inner(
                 key.id.clone(),
                 notification,
                 &mut tracker,
-                Some(key)
+                Durability::Replay(key),
             )
-            .await,
-            "history sync capture or processing did not complete"
-        );
-        Ok(())
+            .await
+        {
+            TaskEnd::Done => Ok(()),
+            TaskEnd::Failed(failure) => Err(chunk_given_up(failure)),
+            TaskEnd::Stopped => Err(anyhow::anyhow!("history sync is shutting down")),
+        }
     }
 
     /// Runs only after the inbound journal has durably retained this carrier.
@@ -470,7 +601,20 @@ impl Client {
                 .capture_history_sync_notification(&key, notification, wire, tracker)
                 .await?
             {
-                tracker.set_durable_key(key);
+                let lease = match self.history_sync_activity.claim(&key) {
+                    HistoryClaim::Lead(lease) => lease,
+                    // The worker or a host replay holds this key's chunk (a
+                    // redelivery): that work ends it, and a failure reaches the
+                    // host as that work's.
+                    HistoryClaim::Join(_) => {
+                        log::debug!(
+                            "History sync {} is in flight already; not queued again",
+                            info.id
+                        );
+                        return Ok(());
+                    }
+                };
+                tracker.set_durable(lease);
                 let task = crate::sync_task::MajorSyncTask::HistorySync {
                     message_id: info.id.to_string(),
                     notification: Box::new(notification),
@@ -686,9 +830,31 @@ impl Client {
         permit: async_lock::SemaphoreGuardArc,
     ) {
         tracker.set_processing_permits(permit, None);
-        let key = tracker.take_durable_key();
-        self.process_history_sync_task_inner(message_id, notification, tracker, key.as_deref())
+        let Some(lease) = tracker.take_durable() else {
+            self.process_history_sync_task_inner(
+                message_id,
+                notification,
+                tracker,
+                Durability::None,
+            )
             .await;
+            return;
+        };
+        let end = self
+            .process_history_sync_task_inner(
+                message_id,
+                notification,
+                tracker,
+                Durability::Worker(lease.key()),
+            )
+            .await;
+        // A stop leaves the flight to end as the lease drops: a later try can
+        // get past it.
+        match end {
+            TaskEnd::Done => lease.finish(Ok(())),
+            TaskEnd::Failed(failure) => lease.finish(Err(failure)),
+            TaskEnd::Stopped => drop(lease),
+        }
     }
 
     async fn process_history_sync_task_inner(
@@ -696,8 +862,9 @@ impl Client {
         message_id: String,
         notification: DetachedHistorySyncNotification,
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
-        durable_key: Option<&HistorySyncKey>,
-    ) -> bool {
+        durability: Durability<'_>,
+    ) -> TaskEnd {
+        let durable_key = durability.key();
         let recovery = if durable_key.is_some() {
             HistoryRecovery::Durable
         } else {
@@ -705,7 +872,7 @@ impl Client {
         };
         if recovery.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped()) {
             log::debug!("Aborting history sync {} before processing", message_id);
-            return false;
+            return TaskEnd::Stopped;
         }
 
         let inline_payload_len = notification.inline_payload.as_ref().map(Bytes::len);
@@ -744,7 +911,7 @@ impl Client {
                 message_id,
                 publication.receipt_at(HistoryReceiptPoint::BeforePayload)
             );
-            return false;
+            return TaskEnd::Stopped;
         }
 
         // Use take() to avoid cloning large payloads - moves ownership instead
@@ -757,14 +924,26 @@ impl Client {
             (inline_payload, payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
-            if publication.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped())
-                || !self.is_socket_connected()
-            {
+            if publication.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped()) {
+                log::debug!(
+                    "Aborting history sync {} before blob download during shutdown",
+                    message_id
+                );
+                return TaskEnd::Stopped;
+            }
+            if !self.is_socket_connected() {
                 log::debug!(
                     "Aborting history sync {} before blob download: client disconnected",
                     message_id
                 );
-                return false;
+                return self
+                    .history_chunk_failed(
+                        durability,
+                        &notification,
+                        inline_payload_len,
+                        HistoryChunkFailure::Network,
+                    )
+                    .await;
             }
             // The native in-memory downloader streams decryption and safely
             // pre-sizes its fresh retry buffer from the declared file length.
@@ -794,10 +973,17 @@ impl Client {
                             "History sync blob download aborted during shutdown: {:?}",
                             e
                         );
-                    } else {
-                        log::error!("Failed to download history sync blob: {:?}", e);
+                        return TaskEnd::Stopped;
                     }
-                    return false;
+                    log::error!("Failed to download history sync blob: {:?}", e);
+                    return self
+                        .history_chunk_failed(
+                            durability,
+                            &notification,
+                            inline_payload_len,
+                            download_failure(&e),
+                        )
+                        .await;
                 }
             }
         };
@@ -805,22 +991,25 @@ impl Client {
 
         if let Some(key) = durable_key {
             let Some(hook) = self.history_sync_durability_hook.get() else {
-                return false;
-            };
-            let metadata = HistorySyncMetadata {
-                sync_type: notification.sync_type.map(|kind| kind as i32),
-                chunk_order: notification.chunk_order,
-                progress: notification.progress,
-                file_length: notification.file_length,
-                inline_payload_len,
-                peer_data_request_session_id: notification.peer_data_request_session_id.as_deref(),
+                return TaskEnd::Stopped;
             };
             if let Err(error) = hook
-                .on_compressed_chunk(key, &metadata, &compressed_data)
+                .on_compressed_chunk(
+                    key,
+                    &chunk_metadata(&notification, inline_payload_len),
+                    &compressed_data,
+                )
                 .await
             {
                 log::warn!("History sync chunk was not durable; withholding receipt: {error:?}");
-                return false;
+                return self
+                    .history_chunk_failed(
+                        durability,
+                        &notification,
+                        inline_payload_len,
+                        HistoryChunkFailure::Capture,
+                    )
+                    .await;
             }
         }
 
@@ -839,7 +1028,14 @@ impl Client {
                     message_id,
                     e
                 );
-                return false;
+                return self
+                    .history_chunk_failed(
+                        durability,
+                        &notification,
+                        inline_payload_len,
+                        HistoryChunkFailure::Capture,
+                    )
+                    .await;
             }
             if publication.receipt_at(HistoryReceiptPoint::Captured) {
                 self.send_protocol_receipt(
@@ -888,7 +1084,7 @@ impl Client {
                 "Aborting history sync {} after parse during shutdown",
                 message_id
             );
-            return false;
+            return TaskEnd::Stopped;
         }
 
         match parse_result {
@@ -1027,14 +1223,55 @@ impl Client {
             }
             Some((Err(e), _)) => {
                 log::error!("Failed to process HistorySync data: {:?}", e);
-                return false;
+                return self
+                    .history_chunk_failed(
+                        durability,
+                        &notification,
+                        inline_payload_len,
+                        HistoryChunkFailure::Malformed,
+                    )
+                    .await;
             }
             None => {
+                // The parse job ended without a result: it panicked on these
+                // bytes, as it would again. The client isn't stopping, or the
+                // check above would have said so.
                 log::error!("History sync blocking task was cancelled");
-                return false;
+                return self
+                    .history_chunk_failed(
+                        durability,
+                        &notification,
+                        inline_payload_len,
+                        HistoryChunkFailure::Malformed,
+                    )
+                    .await;
             }
         }
-        true
+        TaskEnd::Done
+    }
+
+    /// A task of `durability` gave its chunk up for `failure`: a worker task's
+    /// tells the host through its hook
+    /// ([`on_chunk_failed`](crate::HistorySyncDurabilityHook::on_chunk_failed)),
+    /// a replay's is the replay's result.
+    async fn history_chunk_failed(
+        &self,
+        durability: Durability<'_>,
+        notification: &wa::message::HistorySyncNotification,
+        inline_payload_len: Option<usize>,
+        failure: HistoryChunkFailure,
+    ) -> TaskEnd {
+        if let Durability::Worker(key) = durability
+            && let Some(hook) = self.history_sync_durability_hook.get()
+        {
+            hook.on_chunk_failed(
+                key,
+                &chunk_metadata(notification, inline_payload_len),
+                failure,
+            )
+            .await;
+        }
+        TaskEnd::Failed(failure)
     }
 
     #[cfg_attr(
@@ -1217,6 +1454,9 @@ fn push_unique_sender(senders: &mut HistorySecretSenders, sender: Jid) {
         *slot = Some(sender);
     }
 }
+
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
@@ -3414,7 +3654,7 @@ fn history_future_stays_within_baseline_budget() {
             String,
             DetachedHistorySyncNotification,
             &'static mut crate::sync_task::HistorySyncTaskTracker,
-            Option<&'static HistorySyncKey>,
+            Durability<'static>,
         ) -> F,
     ) -> usize {
         size_of::<F>()

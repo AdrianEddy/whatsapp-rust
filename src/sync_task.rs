@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use wacore::appstate::patch_decode::WAPatchName;
@@ -17,6 +18,87 @@ pub(crate) struct HistorySyncActivity {
     pub(crate) processing_permits: Arc<async_lock::Semaphore>,
     /// Replays take this first, leaving global capacity for the sync worker.
     pub(crate) replay_permits: Arc<async_lock::Semaphore>,
+    /// The durable keys whose chunk is in flight: a worker task's (queued or
+    /// running) or a host replay's, one per key ([`Self::claim`]).
+    flights: Mutex<HashMap<crate::HistorySyncKey, Arc<HistoryFlight>>>,
+}
+
+/// One durable key's download and parse in flight ([`HistorySyncActivity::claim`]).
+pub(crate) struct HistoryFlight {
+    ended: event_listener::Event,
+    /// How it ended, set once as it ends.
+    outcome: std::sync::OnceLock<Result<(), crate::HistoryChunkFailure>>,
+}
+
+impl HistoryFlight {
+    /// Its outcome, once it has ended: `Ok` when the chunk was captured and
+    /// parsed.
+    pub(crate) async fn ended(&self) -> Result<(), crate::HistoryChunkFailure> {
+        loop {
+            let ended = self.ended.listen();
+            if let Some(outcome) = self.outcome.get() {
+                return *outcome;
+            }
+            ended.await;
+        }
+    }
+}
+
+/// What claiming a key's chunk gives ([`HistorySyncActivity::claim`]).
+pub(crate) enum HistoryClaim {
+    /// Nothing held the key: the caller's work is its flight.
+    Lead(HistoryFlightLease),
+    /// Another's work holds it: wait for that to end instead.
+    Join(Arc<HistoryFlight>),
+}
+
+/// A key's flight, held by the work that leads it. Its end, through
+/// [`Self::finish`] or a drop (a task cancelled or dropped before it finished,
+/// which a later try can get past: a network failure), frees the key and tells
+/// every joiner how it ended.
+pub(crate) struct HistoryFlightLease {
+    activity: Arc<HistorySyncActivity>,
+    key: crate::HistorySyncKey,
+    flight: Arc<HistoryFlight>,
+    outcome: Result<(), crate::HistoryChunkFailure>,
+}
+
+impl HistoryFlightLease {
+    /// A flight that ended before its work did: the next try can get past it.
+    const INTERRUPTED: Result<(), crate::HistoryChunkFailure> =
+        Err(crate::HistoryChunkFailure::Network);
+
+    pub(crate) fn key(&self) -> &crate::HistorySyncKey {
+        &self.key
+    }
+
+    /// End the flight with `outcome`.
+    pub(crate) fn finish(mut self, outcome: Result<(), crate::HistoryChunkFailure>) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for HistoryFlightLease {
+    fn drop(&mut self) {
+        let _ = self.flight.outcome.set(self.outcome);
+        let mut flights = self.activity.flights_guard();
+        if flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            flights.remove(&self.key);
+        }
+        drop(flights);
+        self.flight.ended.notify(usize::MAX);
+    }
+}
+
+impl std::fmt::Debug for HistoryFlightLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryFlightLease")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HistorySyncActivity {
@@ -26,7 +108,43 @@ impl HistorySyncActivity {
             idle_notifier: event_listener::Event::new(),
             processing_permits: Arc::new(async_lock::Semaphore::new(2)),
             replay_permits: Arc::new(async_lock::Semaphore::new(1)),
+            flights: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Claim `key`'s chunk for the caller's work: the lead, or the flight that
+    /// holds it already. One key has one download and parse at a time, so a
+    /// worker task that outlives its connection and the host's replay of the
+    /// same key on the next one don't both fetch it.
+    pub(crate) fn claim(self: &Arc<Self>, key: &crate::HistorySyncKey) -> HistoryClaim {
+        let mut flights = self.flights_guard();
+        if let Some(flight) = flights.get(key) {
+            return HistoryClaim::Join(Arc::clone(flight));
+        }
+        let flight = Arc::new(HistoryFlight {
+            ended: event_listener::Event::new(),
+            outcome: std::sync::OnceLock::new(),
+        });
+        flights.insert(key.clone(), Arc::clone(&flight));
+        drop(flights);
+        HistoryClaim::Lead(HistoryFlightLease {
+            activity: Arc::clone(self),
+            key: key.clone(),
+            flight,
+            outcome: HistoryFlightLease::INTERRUPTED,
+        })
+    }
+
+    /// How many hold `key`'s flight: the registry, its lead and each joiner.
+    #[cfg(test)]
+    pub(crate) fn flight_holders(&self, key: &crate::HistorySyncKey) -> usize {
+        self.flights_guard().get(key).map_or(0, Arc::strong_count)
+    }
+
+    fn flights_guard(&self) -> MutexGuard<'_, HashMap<crate::HistorySyncKey, Arc<HistoryFlight>>> {
+        self.flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn begin(self: &Arc<Self>, payload_bytes: usize) -> HistorySyncTaskTracker {
@@ -39,7 +157,7 @@ impl HistorySyncActivity {
                 generation,
                 state: Mutex::new(HistorySyncTaskState {
                     payload_bytes,
-                    durable_key: None,
+                    durable: None,
                     processing_permits: None,
                 }),
             }),
@@ -103,8 +221,9 @@ struct HistorySyncTaskTrackerInner {
 struct HistorySyncTaskState {
     payload_bytes: usize,
     // Recovery context follows this one task through the existing public queue
-    // shape. It must not be keyed globally by the non-unique stanza ID.
-    durable_key: Option<Box<crate::HistorySyncKey>>,
+    // shape. It must not be keyed globally by the non-unique stanza ID: the
+    // lease holds the key's flight, keyed by the whole key.
+    durable: Option<Box<HistoryFlightLease>>,
     // A blocking parser/encoder keeps a lease after its async caller is
     // cancelled. Keep both limits in one lease so a detached replay cannot
     // release its replay slot while still occupying global processing capacity.
@@ -150,12 +269,12 @@ impl HistorySyncTaskTracker {
         self.state().processing_permits = None;
     }
 
-    pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
-        self.state().durable_key = Some(Box::new(key));
+    pub(crate) fn set_durable(&mut self, lease: HistoryFlightLease) {
+        self.state().durable = Some(Box::new(lease));
     }
 
-    pub(crate) fn take_durable_key(&mut self) -> Option<Box<crate::HistorySyncKey>> {
-        self.state().durable_key.take()
+    pub(crate) fn take_durable(&mut self) -> Option<Box<HistoryFlightLease>> {
+        self.state().durable.take()
     }
 
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {

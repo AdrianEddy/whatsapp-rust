@@ -5,7 +5,7 @@ use anyhow::Result;
 /// Stanza IDs alone are not unique: deduplicate on all three fields, and keep
 /// each account's records separate. Device components are preserved verbatim.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HistorySyncKey {
     pub chat: String,
     pub sender: String,
@@ -36,6 +36,11 @@ impl HistorySyncKey {
 /// process stops. Keep the notification and schedule retries through
 /// [`crate::Client::replay_history_sync_notification`] until the chunk is durable;
 /// do not depend on server redelivery or the SDK journal surviving its cleanup.
+/// The worker tells the host when it gives a chunk up ([`Self::on_chunk_failed`],
+/// with why), so a host can retry while the connection lasts rather than at its
+/// next start. One key has one download and parse at a time: a carrier
+/// redelivered, or a replay, while the worker or a replay already holds the key
+/// joins that work instead of starting its own.
 ///
 /// Implementations must commit before returning `Ok`, be idempotent, and reject
 /// an existing key with different bytes. Callbacks can repeat after failure,
@@ -76,4 +81,53 @@ pub trait HistorySyncDurabilityHook: wacore::sync_marker::MaybeSendSync {
         metadata: &HistorySyncMetadata<'_>,
         compressed: &[u8],
     ) -> Result<()>;
+
+    /// The history worker gave up on `key`'s chunk, for `failure`: its task for
+    /// the key ended without the chunk captured and parsed. Called once for each
+    /// such task, whatever ended it but a stop of the client (a shutdown or a
+    /// permanent stop calls nothing: the host replays the notifications it kept
+    /// when it starts again). The carrier was acknowledged already, so nothing
+    /// but the host's replay brings the chunk back; the failure says when that
+    /// is worth it. A host replay's own failure is its result, as the same
+    /// [`HistoryChunkFailure`] in the error's chain, not a call here. Runs on the
+    /// history worker; don't await client work from it that waits on the
+    /// worker. The default does nothing.
+    async fn on_chunk_failed(
+        &self,
+        _key: &HistorySyncKey,
+        _metadata: &HistorySyncMetadata<'_>,
+        _failure: HistoryChunkFailure,
+    ) {
+    }
+}
+
+/// Why the history worker gave up on a durable chunk
+/// ([`HistorySyncDurabilityHook::on_chunk_failed`]), or why a host replay
+/// failed (in its error's chain): what a later try can expect.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HistoryChunkFailure {
+    /// The blob wasn't downloaded for a reason a later try can get past: no
+    /// connection to download over, a network or transport failure, a media
+    /// route that couldn't be had, a server error, memory the download
+    /// couldn't have at the time.
+    #[error("the history chunk's download failed")]
+    Network,
+    /// The blob can't be had as the notification references it: the media
+    /// server refused the reference (401, 403, 404 or 410, after a refresh of
+    /// the route), the body the media hosts served fails its MAC, a hash or
+    /// its decryption, the reference makes no request, or the client's
+    /// download policy refuses the blob. Trying again meets the same refusal
+    /// or the same bytes; such a blob takes the primary phone's upload again.
+    #[error("the history chunk's blob can't be had as referenced")]
+    Refused,
+    /// The host's own hook didn't keep the chunk (its `on_compressed_chunk`, or
+    /// a [`HistorySyncCaptureHook`](crate::HistorySyncCaptureHook)'s error).
+    #[error("the host didn't keep the history chunk")]
+    Capture,
+    /// The chunk doesn't parse (it doesn't inflate or decode, or its parse
+    /// stopped with no result), or a replay's notification doesn't decode:
+    /// trying again meets the same bytes.
+    #[error("the history chunk or its notification is malformed")]
+    Malformed,
 }
