@@ -1622,7 +1622,7 @@ mod tests {
             &self,
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
-            _: &[u8],
+            _: &bytes::Bytes,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1631,7 +1631,7 @@ mod tests {
             &self,
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
-            _: &[u8],
+            _: &bytes::Bytes,
         ) -> anyhow::Result<()> {
             Ok(())
         }

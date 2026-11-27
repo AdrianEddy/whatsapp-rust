@@ -8,6 +8,8 @@
 //! A stop of the client calls nothing. A host replay, or a redelivered carrier,
 //! of a key whose task is in flight joins that task: the chunk is downloaded
 //! once. A replay joined to another replay answers as that one ended.
+//!
+//! WF27 at the end: the hook shares the host's replayed bytes.
 
 use super::*;
 use crate::HistoryChunkFailure;
@@ -220,7 +222,7 @@ async fn a_replay_of_a_key_in_flight_downloads_once() {
     let replay = tokio::spawn({
         let client = client.clone();
         let key = key.clone();
-        async move { client.replay_history_sync_notification(&key, &bytes).await }
+        async move { client.replay_history_sync_notification(&key, bytes).await }
     });
     // The replay has joined the task's flight: the registry, the task and it.
     crate::test_utils::poll_until("the replay joined the worker's flight", || {
@@ -252,7 +254,7 @@ async fn a_replay_joined_to_a_failed_task_answers_its_failure() {
     let replay = tokio::spawn({
         let client = client.clone();
         let key = key.clone();
-        async move { client.replay_history_sync_notification(&key, &bytes).await }
+        async move { client.replay_history_sync_notification(&key, bytes).await }
     });
     crate::test_utils::poll_until("the replay joined the worker's flight", || {
         client.history_sync_activity.flight_holders(&key) >= 3
@@ -285,9 +287,11 @@ async fn a_replay_joined_to_a_malformed_replay_answers_malformed() {
     let holder = tokio::spawn({
         let client = client.clone();
         async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+            let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                &notification(),
+            ));
             client
-                .replay_history_sync_notification(&key(&info("WF22_HOLDER")), &bytes)
+                .replay_history_sync_notification(&key(&info("WF22_HOLDER")), bytes)
                 .await
         }
     });
@@ -295,9 +299,11 @@ async fn a_replay_joined_to_a_malformed_replay_answers_malformed() {
     // The first replay of the key leads it and waits for the permit; the second
     // joins its flight: the registry, the lead and it.
     let malformed = key(&info("WF22_MALFORMED"));
-    let mut leader = Box::pin(client.replay_history_sync_notification(&malformed, &[255]));
+    let mut leader =
+        Box::pin(client.replay_history_sync_notification(&malformed, Bytes::from_static(&[255])));
     assert!(futures::poll!(leader.as_mut()).is_pending());
-    let mut joiner = Box::pin(client.replay_history_sync_notification(&malformed, &[255]));
+    let mut joiner =
+        Box::pin(client.replay_history_sync_notification(&malformed, Bytes::from_static(&[255])));
     assert!(futures::poll!(joiner.as_mut()).is_pending());
     assert_eq!(client.history_sync_activity.flight_holders(&malformed), 3);
     hook.chunk_parked.store(false, Ordering::SeqCst);
@@ -329,4 +335,27 @@ async fn a_redelivered_carrier_in_flight_is_not_queued_again() {
     history_idle(&client).await;
     assert_eq!(host.requests.load(Ordering::SeqCst), 1);
     assert_eq!(hook.chunks.load(Ordering::SeqCst), 1);
+}
+
+/// WF27: the hook takes the notification the host replays as the host's own
+/// bytes, shared, not copied.
+#[tokio::test]
+async fn a_replayed_notification_reaches_the_hook_as_the_hosts_bytes() {
+    let (client, hook, _transport) = memory_client().await;
+    hook.require_journal.store(false, Ordering::SeqCst);
+    let held = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+        &notification(),
+    ));
+    client
+        .replay_history_sync_notification(&key(&info("WF27_SHARED")), held.clone())
+        .await
+        .unwrap();
+    let records = hook.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1, held);
+    assert_eq!(
+        records[0].1.as_ptr(),
+        held.as_ptr(),
+        "the hook got a copy of the host's bytes"
+    );
 }

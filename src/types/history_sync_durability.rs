@@ -1,5 +1,6 @@
 use crate::HistorySyncMetadata;
 use anyhow::Result;
+use bytes::Bytes;
 
 /// Identity of one self-sent history notification, scoped to the Client account.
 /// Stanza IDs alone are not unique: deduplicate on all three fields, and keep
@@ -66,20 +67,24 @@ impl HistorySyncKey {
 pub trait HistorySyncDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// Retain the complete encoded `HistorySyncNotification`, including inline
     /// payload, before attempting download, processing, or a positive receipt.
+    /// The bytes are shared, not lent: a host that keeps them clones the
+    /// `Bytes` (a reference count), with no copy.
     async fn on_notification(
         &self,
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
-        notification: &[u8],
+        notification: &Bytes,
     ) -> Result<()>;
 
     /// Retain the decrypted, zlib-compressed chunk before its receipt. Parsing
-    /// follows this callback; malformed chunks remain unacknowledged.
+    /// follows this callback; malformed chunks remain unacknowledged. The
+    /// chunk is the client's own buffer, which it parses next: a host that
+    /// keeps it clones the `Bytes`, with no copy.
     async fn on_compressed_chunk(
         &self,
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
-        compressed: &[u8],
+        compressed: &Bytes,
     ) -> Result<()>;
 
     /// The history worker gave up on `key`'s chunk, for `failure`: its task for

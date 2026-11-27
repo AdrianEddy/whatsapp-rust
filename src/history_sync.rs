@@ -77,20 +77,27 @@ impl wacore::runtime::Runtime for HistoryDownloadRuntime {
 
 fn encode_history_sync_notification(
     notification: DetachedHistorySyncNotification,
-    wire: Vec<Bytes>,
+    mut wire: Vec<Bytes>,
     tracker: crate::sync_task::HistorySyncTaskTracker,
 ) -> (
     DetachedHistorySyncNotification,
-    Vec<u8>,
+    Bytes,
     crate::sync_task::HistorySyncTaskTracker,
 ) {
     // Generated models discard unknown fields. Retain the original wire,
     // merging repeated singular submessages by concatenation, not re-encoding.
+    // A wire of one fragment (a replay's notification, a carrier's usual
+    // shape) is the encoding itself, shared rather than copied.
+    if wire.len() == 1
+        && let Some(encoded) = wire.pop()
+    {
+        return (notification, encoded, tracker);
+    }
     let mut encoded = Vec::with_capacity(wire.iter().map(Bytes::len).sum());
     for fragment in wire {
         encoded.extend_from_slice(&fragment);
     }
-    (notification, encoded, tracker)
+    (notification, Bytes::from(encoded), tracker)
 }
 
 fn history_sync_metadata<'a>(
@@ -443,7 +450,7 @@ impl Client {
     pub async fn replay_history_sync_notification(
         self: &Arc<Self>,
         key: &HistorySyncKey,
-        notification: &[u8],
+        notification: Bytes,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.history_sync_durability_hook.get().is_some(),
@@ -490,7 +497,7 @@ impl Client {
     async fn replay_claimed(
         self: &Arc<Self>,
         key: &HistorySyncKey,
-        notification: &[u8],
+        notification: Bytes,
     ) -> anyhow::Result<()> {
         // Reserve replay capacity before the shared pool so waiting replays
         // cannot occupy the slot needed to drain the normal sync queue. Both
@@ -505,30 +512,13 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("history sync is shutting down"))?;
         let mut tracker = self.begin_history_sync_task(0);
         tracker.set_processing_permits(permit, Some(replay_permit));
-        let retained_wire;
+        let retained_wire = notification.clone();
         let notification: DetachedHistorySyncNotification = if notification.len()
             >= INLINE_NOTIFICATION_ENCODING_THRESHOLD
         {
-            // The borrowed API needs an owned input for the blocking worker.
-            // Bound each executor copy and yield even on runtimes without a
-            // yield implementation; decoding and inline copies run off-thread.
-            let mut encoded = Vec::with_capacity(notification.len());
-            for chunk in notification.chunks(64 * 1024) {
-                encoded.extend_from_slice(chunk);
-                let mut yielded = false;
-                futures::future::poll_fn(|cx| {
-                    if yielded {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded = true;
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
-            let encoded = Bytes::from(encoded);
-            retained_wire = encoded.clone();
+            // Decoding (and its inline payload's copies) runs off-thread; the
+            // worker shares the host's bytes.
+            let encoded = notification;
             let mut lease = tracker.blocking_lease();
             let (tx, rx) = futures::channel::oneshot::channel();
             let work = self.runtime.spawn_blocking(Box::new(move || {
@@ -546,8 +536,7 @@ impl Client {
             rx.await
                 .map_err(|_| anyhow::anyhow!("history notification decoder stopped"))??
         } else {
-            retained_wire = Bytes::copy_from_slice(notification);
-            let notification = waproto::codec::history_sync_notification_decode(notification)
+            let notification = waproto::codec::history_sync_notification_decode(&notification)
                 .map_err(malformed_notification)?;
             let notification = DetachedHistorySyncNotification::from(notification);
             tracker.set_payload_bytes(notification.inline_payload.as_ref().map_or(0, Bytes::len));

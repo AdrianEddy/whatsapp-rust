@@ -19799,7 +19799,7 @@ async fn undelivered_entries_look_up_no_recovery_without_inbound_hook() {
             &self,
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
-            _: &[u8],
+            _: &bytes::Bytes,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -19808,7 +19808,7 @@ async fn undelivered_entries_look_up_no_recovery_without_inbound_hook() {
             &self,
             _: &crate::HistorySyncKey,
             _: &crate::HistorySyncMetadata<'_>,
-            _: &[u8],
+            _: &bytes::Bytes,
         ) -> anyhow::Result<()> {
             Ok(())
         }

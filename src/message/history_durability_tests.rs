@@ -11,7 +11,7 @@ use waproto::whatsapp as wa;
 
 #[derive(Default)]
 struct RecordingHistory {
-    records: Mutex<Vec<(HistorySyncKey, Vec<u8>)>>,
+    records: Mutex<Vec<(HistorySyncKey, Bytes)>>,
     notifications: AtomicUsize,
     chunks: AtomicUsize,
     fail: AtomicU8,
@@ -33,7 +33,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
         &self,
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
-        notification: &[u8],
+        notification: &Bytes,
     ) -> anyhow::Result<()> {
         self.notifications.fetch_add(1, Ordering::SeqCst);
         if self.require_journal.load(Ordering::SeqCst) {
@@ -75,7 +75,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
             if let Some((_, previous)) = records.iter().find(|(previous, _)| previous == key) {
                 anyhow::ensure!(previous == notification, "conflicting notification");
             } else {
-                records.push((key.clone(), notification.to_vec()));
+                records.push((key.clone(), notification.clone()));
             }
         }
         if self.parked.load(Ordering::SeqCst) {
@@ -89,7 +89,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
         &self,
         key: &HistorySyncKey,
         metadata: &HistorySyncMetadata<'_>,
-        compressed: &[u8],
+        compressed: &Bytes,
     ) -> anyhow::Result<()> {
         self.chunks.fetch_add(1, Ordering::SeqCst);
         {
@@ -101,7 +101,7 @@ impl HistorySyncDurabilityHook for RecordingHistory {
             let decoded = waproto::codec::history_sync_notification_decode(notification)?;
             assert_eq!(metadata.chunk_order, decoded.chunk_order);
             if let Some(inline) = decoded.initial_hist_bootstrap_inline_payload {
-                assert_eq!(compressed, inline);
+                assert_eq!(compressed.as_ref(), inline.as_slice());
             }
         }
         if self.chunk_parked.load(Ordering::SeqCst) {
@@ -445,7 +445,7 @@ async fn durable_history_host_replay_checks_identity_and_retains_metadata() {
     let (second, recovered, _) = memory_client().await;
     recovered.require_journal.store(false, Ordering::SeqCst);
     second
-        .replay_history_sync_notification(&key, &bytes)
+        .replay_history_sync_notification(&key, bytes.clone())
         .await
         .unwrap();
     assert_eq!(recovered.chunks.load(Ordering::SeqCst), 1);
@@ -469,7 +469,7 @@ async fn durable_history_host_replay_checks_identity_and_retains_metadata() {
     ] {
         assert!(
             second
-                .replay_history_sync_notification(&foreign, &bytes)
+                .replay_history_sync_notification(&foreign, bytes.clone())
                 .await
                 .is_err()
         );
@@ -477,7 +477,7 @@ async fn durable_history_host_replay_checks_identity_and_retains_metadata() {
     assert_eq!(recovered.notifications.load(Ordering::SeqCst), 1);
     assert!(
         second
-            .replay_history_sync_notification(&key, &[255])
+            .replay_history_sync_notification(&key, Bytes::from_static(&[255]))
             .await
             .is_err()
     );
@@ -658,9 +658,11 @@ async fn durable_history_inline_replay_before_run_succeeds_but_terminal_replay_i
     );
     hook.require_journal.store(false, Ordering::SeqCst);
     let key = key(&info("BEFORE_RUN"));
-    let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+    let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+        &notification(),
+    ));
     client
-        .replay_history_sync_notification(&key, &bytes)
+        .replay_history_sync_notification(&key, bytes.clone())
         .await
         .unwrap();
     assert_eq!(hook.chunks.load(Ordering::SeqCst), 1);
@@ -668,7 +670,7 @@ async fn durable_history_inline_replay_before_run_succeeds_but_terminal_replay_i
     client.signal_shutdown_sync();
     assert!(
         client
-            .replay_history_sync_notification(&key, &bytes)
+            .replay_history_sync_notification(&key, bytes.clone())
             .await
             .is_err()
     );
@@ -690,9 +692,11 @@ async fn durable_history_worker_and_replay_share_two_permits_and_cancellation_re
     let replay = |id: &'static str| {
         let client = client.clone();
         tokio::spawn(async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+            let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                &notification(),
+            ));
             client
-                .replay_history_sync_notification(&key(&info(id)), &bytes)
+                .replay_history_sync_notification(&key(&info(id)), bytes.clone())
                 .await
         })
     };
@@ -776,9 +780,11 @@ async fn durable_history_two_replays_leave_capacity_for_normal_sync_intake() {
     let first = tokio::spawn({
         let client = client.clone();
         async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+            let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                &notification(),
+            ));
             client
-                .replay_history_sync_notification(&key(&info("FIRST_REPLAY")), &bytes)
+                .replay_history_sync_notification(&key(&info("FIRST_REPLAY")), bytes.clone())
                 .await
         }
     });
@@ -789,9 +795,11 @@ async fn durable_history_two_replays_leave_capacity_for_normal_sync_intake() {
     .await
     .unwrap();
 
-    let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+    let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+        &notification(),
+    ));
     let second_key = key(&info("SECOND_REPLAY"));
-    let mut second = Box::pin(client.replay_history_sync_notification(&second_key, &bytes));
+    let mut second = Box::pin(client.replay_history_sync_notification(&second_key, bytes.clone()));
     assert!(futures::poll!(second.as_mut()).is_pending());
     assert_eq!(hook.notifications.load(Ordering::SeqCst), 1);
 
@@ -832,9 +840,11 @@ async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_a_perm
     let replay = tokio::spawn({
         let client = client.clone();
         async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+            let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                &notification(),
+            ));
             client
-                .replay_history_sync_notification(&key(&info("TERMINAL_WAIT")), &bytes)
+                .replay_history_sync_notification(&key(&info("TERMINAL_WAIT")), bytes.clone())
                 .await
         }
     });
@@ -859,9 +869,11 @@ async fn durable_history_terminal_transition_cancels_a_replay_waiting_for_replay
         .replay_permits
         .acquire_arc()
         .await;
-    let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+    let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+        &notification(),
+    ));
     let replay_key = key(&info("TERMINAL_REPLAY_CAPACITY"));
-    let mut replay = Box::pin(client.replay_history_sync_notification(&replay_key, &bytes));
+    let mut replay = Box::pin(client.replay_history_sync_notification(&replay_key, bytes.clone()));
     assert!(futures::poll!(replay.as_mut()).is_pending());
     client.signal_shutdown_sync();
     assert!(
@@ -931,9 +943,11 @@ async fn durable_history_cancelled_download_keeps_cpu_and_replay_leases() {
     let replay = tokio::spawn({
         let client = client.clone();
         async move {
-            let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+            let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                &notification,
+            ));
             client
-                .replay_history_sync_notification(&key(&info("DOWNLOAD_CPU_CANCEL")), &bytes)
+                .replay_history_sync_notification(&key(&info("DOWNLOAD_CPU_CANCEL")), bytes.clone())
                 .await
         }
     });
@@ -1164,9 +1178,11 @@ async fn durable_history_cancelled_replay_keeps_permit_until_blocking_decode_or_
         let replay = tokio::spawn({
             let client = client.clone();
             async move {
-                let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+                let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                    &notification,
+                ));
                 client
-                    .replay_history_sync_notification(&key(&info("CANCEL_ENCODING")), &bytes)
+                    .replay_history_sync_notification(&key(&info("CANCEL_ENCODING")), bytes.clone())
                     .await
             }
         });
@@ -1230,9 +1246,11 @@ async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_unti
             async move {
                 let mut notification = notification();
                 notification.initial_hist_bootstrap_inline_payload = Some(vec![0xa5; 1024 * 1024]);
-                let bytes = waproto::codec::history_sync_notification_to_vec(&notification);
+                let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+                    &notification,
+                ));
                 client
-                    .replay_history_sync_notification(&key(&info("CANCEL_CPU")), &bytes)
+                    .replay_history_sync_notification(&key(&info("CANCEL_CPU")), bytes.clone())
                     .await
             }
         });
@@ -1255,9 +1273,12 @@ async fn durable_history_cancelled_blocking_replay_reserves_normal_capacity_unti
         assert!(futures::poll!(startup.as_mut()).is_pending());
         let before = hook.notifications.load(Ordering::SeqCst);
         assert_eq!(before, usize::from(parsing));
-        let bytes = waproto::codec::history_sync_notification_to_vec(&notification());
+        let bytes = Bytes::from(waproto::codec::history_sync_notification_to_vec(
+            &notification(),
+        ));
         let second_key = key(&info("WAITING_FOR_CPU"));
-        let mut second = Box::pin(client.replay_history_sync_notification(&second_key, &bytes));
+        let mut second =
+            Box::pin(client.replay_history_sync_notification(&second_key, bytes.clone()));
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert_eq!(hook.notifications.load(Ordering::SeqCst), before);
 
@@ -1315,7 +1336,7 @@ async fn durable_history_replay_retains_unknown_notification_fields() {
         wire
     );
     client
-        .replay_history_sync_notification(&key(&info("UNKNOWN_WIRE")), &wire)
+        .replay_history_sync_notification(&key(&info("UNKNOWN_WIRE")), Bytes::from(wire.clone()))
         .await
         .unwrap();
     assert_eq!(hook.records.lock().unwrap()[0].1, wire);
@@ -1331,7 +1352,10 @@ async fn durable_history_reconnect_keeps_parked_replay_accounted() {
         async move {
             let wire = waproto::codec::history_sync_notification_to_vec(&notification());
             client
-                .replay_history_sync_notification(&key(&info("RECONNECT_ACCOUNTING")), &wire)
+                .replay_history_sync_notification(
+                    &key(&info("RECONNECT_ACCOUNTING")),
+                    Bytes::from(wire.clone()),
+                )
                 .await
         }
     });
