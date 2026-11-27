@@ -1,5 +1,5 @@
 use super::traits::StanzaHandler;
-use crate::client::Client;
+use crate::client::{Announced, Client, SyncScope, SyncSettles};
 use crate::types::events::{
     ClientExpirationChanged, DirtyState, Event, EventKind, OfflineSyncPreview,
 };
@@ -139,45 +139,18 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
 
                         if needs_resync && !client_clone.is_shutting_down() {
                             info!("syncd_app_state dirty -- re-syncing all app state collections");
-                            let requested = vec![
-                                WAPatchName::CriticalBlock,
-                                WAPatchName::CriticalUnblockLow,
-                                WAPatchName::RegularLow,
-                                WAPatchName::RegularHigh,
-                                WAPatchName::Regular,
-                            ];
-                            let result = client_clone
-                                .sync_collections_batched(requested.clone(), scope)
-                                .await;
-                            // Rebound again after the batch. The scope was
-                            // pinned before it, so a reconnect during the sync
-                            // would have `report_background_sync` discard the
-                            // outcome — and with it the retry — for collections
-                            // whose dirty bit the server already considers
-                            // clean. Reporting against the live connection keeps
-                            // the retry, and the outcome describes the
-                            // collections either way.
-                            let mut scope = scope;
-                            scope.rebind(
-                                client_clone
-                                    .connection_generation
-                                    .load(std::sync::atomic::Ordering::SeqCst),
-                            );
-                            // Reported unless the client is going away for
-                            // good. A planned reconnect used to drop this, which
-                            // took the retry with it — and the server already
-                            // considers the dirty bit clean, so nothing would
-                            // ask again. The scheduler rebinds once the
-                            // replacement is live.
-                            if !client_clone.is_terminal() {
-                                client_clone.report_background_sync(
-                                    "app state re-sync after dirty notification",
-                                    scope,
-                                    crate::client::SyncSettles::JustTheCollections,
-                                    &requested,
-                                    result,
-                                );
-                            }
+                            resync_dirty_app_state(
+                                &client_clone,
+                                vec![
+                                    WAPatchName::CriticalBlock,
+                                    WAPatchName::CriticalUnblockLow,
+                                    WAPatchName::RegularLow,
+                                    WAPatchName::RegularHigh,
+                                    WAPatchName::Regular,
+                                ],
+                                scope,
+                            )
+                            .await;
                         }
                     }))
                     .detach();
@@ -348,6 +321,61 @@ fn log_unsupported_capability(client: &Client, bit: u8, message: &'static str) {
             debug!("{message}");
         }
     }
+}
+
+/// The `syncd_app_state` dirty bit's re-sync of `requested`, once its clean IQ
+/// is sent, on `scope` (the connection live after that IQ).
+///
+/// A collection another sync holds is fetched after that sync
+/// ([`Client::follow_skipped`]): the bit names no version, and that sync's
+/// answer may predate it. The followers keep `scope`, the one the sync they
+/// follow skipped under, so a reconnect that clears the registry under them
+/// hands their collections to the next connection.
+pub(crate) async fn resync_dirty_app_state(
+    client: &Arc<Client>,
+    requested: Vec<WAPatchName>,
+    scope: SyncScope,
+) {
+    let announced: Vec<(WAPatchName, Announced)> = requested
+        .iter()
+        .map(|&name| (name, Announced::Unversioned))
+        .collect();
+    let mut result = client
+        .sync_collections_batched(requested.clone(), scope)
+        .await;
+    let followers = client.follow_skipped(&mut result, &announced);
+    // Reported against the live connection. The scope was pinned before the
+    // batch, so a reconnect during the sync would have `report_background_sync`
+    // discard the outcome — and with it the retry — for collections whose dirty
+    // bit the server already considers clean. Reporting against the live
+    // connection keeps the retry, and the outcome describes the collections
+    // either way.
+    let mut reported = scope;
+    reported.rebind(
+        client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    // Reported unless the client is going away for good. A planned reconnect
+    // used to drop this, which took the retry with it — and the server already
+    // considers the dirty bit clean, so nothing would ask again. The scheduler
+    // rebinds once the replacement is live.
+    if !client.is_terminal() {
+        client.report_background_sync(
+            "app state re-sync after dirty notification",
+            reported,
+            SyncSettles::JustTheCollections,
+            &requested,
+            result,
+        );
+    }
+    client
+        .run_followers(
+            followers,
+            scope,
+            "app state re-sync after dirty notification, after the sync it skipped behind",
+        )
+        .await;
 }
 
 /// `<ib><client_expiration t=...>`: the server naming the date it expects to

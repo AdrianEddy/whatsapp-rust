@@ -232,6 +232,10 @@ use companion_reg::*;
 // resolving for device_registry.rs.
 pub(crate) use device::*;
 use groups::*;
+// The `server_sync` task, for the app-state tests that announce a change while
+// another sync holds its collection.
+#[cfg(test)]
+pub(crate) use groups::server_sync;
 use privacy_business::*;
 use profile::*;
 

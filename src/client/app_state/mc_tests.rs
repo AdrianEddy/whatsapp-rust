@@ -31,6 +31,11 @@
 //! WF19 (`conflicts`): in a batched round that refusal is one collection's. It
 //! is synced again later, after what its list committed before it is announced,
 //! and the round's other collections are applied as if it hadn't been there.
+//!
+//! WF21 (`skipped`): a change announced (a `server_sync`, the dirty bit's
+//! re-sync) while another sync holds its collection is fetched once that sync
+//! ends, unless that sync stored what it announced, and on the next connection
+//! when its own ends first.
 
 use super::*;
 use crate::client::ClientBuilder;
@@ -1988,3 +1993,5 @@ async fn app_state_recovery_refused_by_the_store_converges_by_a_sync() {
 
 #[path = "mc_tests/conflicts.rs"]
 mod conflicts;
+#[path = "mc_tests/skipped.rs"]
+mod skipped;

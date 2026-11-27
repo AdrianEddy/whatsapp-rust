@@ -287,21 +287,113 @@ const RECOVERY_HOLDER: SyncHolder = SyncHolder::PatchSend;
 /// collection. Releases run from the guard's `Drop`, so a cancelled sync
 /// (timeout, abort, teardown) can never strand a collection as "in flight".
 /// The mutex is synchronous and never held across an await.
+///
+/// A server announcement that skips behind a sync ([`Self::follow`]) is left on
+/// the holder's reservation, under the same lock as its release, so the sync
+/// that follows the holder learns of every announcement the holder outlived and
+/// none is lost between the skip and the release.
 pub(crate) struct SyncInFlight {
-    entries: std::sync::Mutex<HashMap<WAPatchName, (u64, SyncHolder)>>,
+    entries: std::sync::Mutex<Reservations>,
     next_token: AtomicU64,
     /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
     /// can wait for one instead of spinning.
     pub(crate) released: event_listener::Event,
 }
 
+/// What a server announcement says a collection has reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Announced {
+    /// The collection's version on the server (a `server_sync` child's
+    /// `version`): a sync that stored it has the announced change.
+    Version(u64),
+    /// No version (a `syncd_app_state` dirty bit, a `server_sync` child without
+    /// one): only a fetch made after the announcement covers it.
+    Unversioned,
+}
+
+impl Announced {
+    /// Both announcements: the later version, and no version over any.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Version(a), Self::Version(b)) => Self::Version(a.max(b)),
+            _ => Self::Unversioned,
+        }
+    }
+
+    /// Whether a collection stored at `stored` has the announced change.
+    fn reached_by(self, stored: Option<u64>) -> bool {
+        match self {
+            Self::Version(version) => stored.is_some_and(|stored| stored >= version),
+            Self::Unversioned => false,
+        }
+    }
+}
+
+/// Where an announcement that skipped behind a sync was left ([`SyncInFlight::follow`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Follow {
+    /// On the reservation `token`: its first, so the caller follows it.
+    After(u64),
+    /// On a reservation another caller already follows, merged with what it
+    /// carries.
+    Covered,
+    /// Nothing holds the collection any more: the caller syncs it now.
+    Free,
+}
+
+/// A collection whose announcement skipped behind a sync, to fetch after it
+/// ([`Client::follow_skipped`]).
+#[derive(Debug)]
+pub(crate) struct Follower {
+    name: WAPatchName,
+    /// The reservation to wait for; `None` when it was released already.
+    after: Option<u64>,
+    announced: Announced,
+}
+
+/// What a holder left of a collection once its follower looks
+/// ([`SyncInFlight::left_by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Left {
+    /// It holds the collection still.
+    Holding,
+    /// It released it, with these announcements left on it.
+    Released(Announced),
+    /// Its reservation is gone, and nothing is left under its token: a later
+    /// holder's release took what was left with its own (that holder began
+    /// after this one's release, so after it), for that holder's follower; or
+    /// the registry was cleared for a new connection. A reconnect retires the
+    /// connection before it clears the registry, so a follower that finds this
+    /// while its connection is still the live one knows it was the former.
+    Cleared,
+}
+
+#[derive(Default)]
+struct Reservations {
+    held: HashMap<WAPatchName, Held>,
+    /// The announcements a released holder left, by collection, for its
+    /// follower to take; the token is the holder's.
+    left: HashMap<WAPatchName, (u64, Announced)>,
+}
+
+struct Held {
+    token: u64,
+    holder: SyncHolder,
+    /// The announcements that skipped behind this holder, merged.
+    announced: Option<Announced>,
+}
+
 impl SyncInFlight {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            entries: std::sync::Mutex::new(HashMap::new()),
+            entries: std::sync::Mutex::new(Reservations::default()),
             next_token: AtomicU64::new(0),
             released: event_listener::Event::new(),
         })
+    }
+
+    fn reservations(&self) -> std::sync::MutexGuard<'_, Reservations> {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Whether anything holds `name` right now.
@@ -311,10 +403,55 @@ impl SyncInFlight {
     /// sync that looked in that window would stand down and report a collection
     /// skipped that nothing was actually doing.
     pub(crate) fn is_held(&self, name: WAPatchName) -> bool {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&name)
+        self.reservations().held.contains_key(&name)
+    }
+
+    /// Leave `announced` on the reservation holding `name`, for the sync that
+    /// follows it: the caller skipped behind that holder, whose fetch may have
+    /// been answered before the change the announcement names.
+    ///
+    /// The first announcement left on a reservation makes its caller the
+    /// follower ([`Follow::After`]); later ones merge into it
+    /// ([`Follow::Covered`]), so the holder's release is followed by one sync,
+    /// which knows the latest. A collection nothing holds any more
+    /// ([`Follow::Free`]) was released between the skip and this call.
+    pub(crate) fn follow(&self, name: WAPatchName, announced: Announced) -> Follow {
+        let mut reservations = self.reservations();
+        let Some(held) = reservations.held.get_mut(&name) else {
+            return Follow::Free;
+        };
+        match &mut held.announced {
+            Some(left) => {
+                *left = left.merge(announced);
+                Follow::Covered
+            }
+            slot @ None => {
+                *slot = Some(announced);
+                Follow::After(held.token)
+            }
+        }
+    }
+
+    /// What the reservation `token` left of `name` ([`Left`]), taking it.
+    pub(crate) fn left_by(&self, name: WAPatchName, token: u64) -> Left {
+        let mut reservations = self.reservations();
+        if reservations
+            .held
+            .get(&name)
+            .is_some_and(|held| held.token == token)
+        {
+            return Left::Holding;
+        }
+        match reservations.left.get(&name) {
+            Some(&(holder, announced)) if holder == token => {
+                reservations.left.remove(&name);
+                Left::Released(announced)
+            }
+            // A later holder's release merged this one's into its own (its sync
+            // began after this holder's release, so after every announcement
+            // left on it), and that holder's follower takes them.
+            _ => Left::Cleared,
+        }
     }
 
     /// Reserve `name` for `holder`, or report what already holds it.
@@ -324,11 +461,18 @@ impl SyncInFlight {
         holder: SyncHolder,
     ) -> Result<SyncInFlightGuard, SyncHolder> {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(&(_, current)) = entries.get(&name) {
-            return Err(current);
+        let mut reservations = self.reservations();
+        if let Some(current) = reservations.held.get(&name) {
+            return Err(current.holder);
         }
-        entries.insert(name, (token, holder));
+        reservations.held.insert(
+            name,
+            Held {
+                token,
+                holder,
+                announced: None,
+            },
+        );
         Ok(SyncInFlightGuard {
             registry: Arc::clone(self),
             name,
@@ -370,15 +514,17 @@ impl SyncInFlight {
         }
     }
 
-    /// Drop every reservation, releasing backing storage. Guards from before
-    /// the clear become no-ops thanks to the token check.
+    /// Drop every reservation and what released ones left, releasing backing
+    /// storage. Guards from before the clear become no-ops thanks to the token
+    /// check, and their followers, whose connection the reconnect retired
+    /// first, hand their collections to the next one ([`Client::carry_over`]).
     pub(crate) fn clear(&self) {
-        *self.entries.lock().unwrap_or_else(|p| p.into_inner()) = HashMap::new();
+        *self.reservations() = Reservations::default();
         self.released.notify(usize::MAX);
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.reservations().held.len()
     }
 }
 
@@ -390,18 +536,30 @@ pub(crate) struct SyncInFlightGuard {
 
 impl Drop for SyncInFlightGuard {
     fn drop(&mut self) {
-        let mut entries = self
-            .registry
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if entries
+        let mut reservations = self.registry.reservations();
+        if reservations
+            .held
             .get(&self.name)
-            .is_some_and(|&(t, _)| t == self.token)
+            .is_some_and(|held| held.token == self.token)
         {
-            entries.remove(&self.name);
+            let released = reservations.held.remove(&self.name);
+            if let Some(Held {
+                announced: Some(announced),
+                ..
+            }) = released
+            {
+                // Under the release's lock, so the follower finds them however
+                // late it looks. A previous holder's not yet taken goes with
+                // them: this holder began after that release, so after those
+                // announcements.
+                let announced = match reservations.left.get(&self.name) {
+                    Some(&(_, earlier)) => earlier.merge(announced),
+                    None => announced,
+                };
+                reservations.left.insert(self.name, (self.token, announced));
+            }
         }
-        drop(entries);
+        drop(reservations);
         // Waiters are keyed by nothing, so wake all of them and let each
         // re-check its own collection.
         self.registry.released.notify(usize::MAX);
@@ -1156,6 +1314,202 @@ impl Client {
                 );
             }
         }
+    }
+
+    /// Take every collection of `result` that skipped behind another sync and
+    /// that `announced` names out of `skipped`, leave its announcement on the
+    /// sync holding it ([`SyncInFlight::follow`]), and return the followers to
+    /// run ([`Self::run_followers`]) once the outcome is reported.
+    ///
+    /// A skip behind an equivalent sync is sound for work the holder subsumes,
+    /// but not for a change the server announces while the holder runs: the
+    /// holder's fetch may have been answered before the change was made, and
+    /// nothing else asks for it until the next trigger. WhatsApp Web re-runs a
+    /// collection marked dirty during its in-flight sync; here the sync that
+    /// follows the holder's release fetches it, unless what the holder stored
+    /// reached the announcement. Such a collection is covered, not unsynced, so
+    /// it leaves the outcome: the follower reports its own. `announced` names
+    /// each collection once, with what its announcements say together
+    /// ([`Announced::merge`]).
+    pub(crate) fn follow_skipped(
+        &self,
+        result: &mut Result<BatchedSyncOutcome>,
+        announced: &[(WAPatchName, Announced)],
+    ) -> Vec<Follower> {
+        let mut followers = Vec::new();
+        let Ok(outcome) = result else {
+            return followers;
+        };
+        outcome.skipped.retain(|&name| {
+            let Some(&(_, announced)) = announced.iter().find(|(named, _)| *named == name) else {
+                return true;
+            };
+            let after = match self.app_state_syncing.follow(name, announced) {
+                Follow::After(token) => Some(token),
+                Follow::Free => None,
+                Follow::Covered => {
+                    debug!(target: "Client/AppState", "{name:?} announced {announced:?} behind a sync another follower waits for");
+                    return false;
+                }
+            };
+            debug!(target: "Client/AppState", "{name:?} announced {announced:?} behind a sync: fetched after it unless it reached that");
+            followers.push(Follower {
+                name,
+                after,
+                announced,
+            });
+            false
+        });
+        followers
+    }
+
+    /// Run [`Self::follow_skipped`]'s followers, each until its collection is
+    /// fetched or found reached, or its connection is gone, which hands the
+    /// collection to the next one ([`Self::carry_over`]); each fetch is
+    /// reported under `label` ([`Self::report_announced_sync`]). `scope` is the
+    /// one the skipped sync ran under: a reconnect retires it before it clears
+    /// the registry, which is how a follower tells the two apart
+    /// ([`Left::Cleared`]).
+    pub(crate) async fn run_followers(
+        self: &Arc<Self>,
+        followers: Vec<Follower>,
+        scope: SyncScope,
+        label: &str,
+    ) {
+        futures::future::join_all(
+            followers
+                .into_iter()
+                .map(|follower| self.follow_holder(follower, scope, label)),
+        )
+        .await;
+    }
+
+    /// One follower ([`Self::run_followers`]): wait for the holder's release,
+    /// take what was left on it, and fetch the collection unless what it stored
+    /// reached that; if yet another sync holds it by then, follow that one.
+    async fn follow_holder(self: &Arc<Self>, follower: Follower, scope: SyncScope, label: &str) {
+        let Follower {
+            name,
+            mut after,
+            mut announced,
+        } = follower;
+        loop {
+            if let Some(token) = after {
+                loop {
+                    // Listening before looking, so a release between the two
+                    // isn't missed.
+                    let released = self.app_state_syncing.released.listen();
+                    // Looked at before the connection is asked about: a
+                    // reconnect retires the connection before it clears the
+                    // registry, so a reservation found cleared while the
+                    // connection is still the live one was a later holder's
+                    // merge.
+                    let left = self.app_state_syncing.left_by(name, token);
+                    if self.is_shutting_down() || self.admits(scope).is_err() {
+                        self.carry_over(vec![name], scope);
+                        return;
+                    }
+                    match left {
+                        Left::Holding => released.await,
+                        // Every announcement left on the holder, this one's
+                        // included.
+                        Left::Released(left) => {
+                            announced = left;
+                            break;
+                        }
+                        // The later holder's follower takes them, with its own.
+                        Left::Cleared => return,
+                    }
+                }
+            }
+            match self
+                .persistence_manager
+                .backend()
+                .get_version(name.as_str())
+                .await
+            {
+                Ok(stored) if announced.reached_by(stored.as_ref().map(|state| state.version)) => {
+                    debug!(target: "Client/AppState", "{name:?}: the sync it skipped behind reached {announced:?}");
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "Client/AppState", "Failed to read the version of {name:?} after the sync it skipped behind: {error}; syncing anyway");
+                }
+            }
+            let mut result = self.sync_collections_batched(vec![name], scope).await;
+            if let Some(next) = self.follow_skipped(&mut result, &[(name, announced)]).pop() {
+                // Held again, by a sync that began after the release: follow it
+                // in turn. The outcome holds nothing else.
+                after = next.after;
+                announced = next.announced;
+                continue;
+            }
+            self.report_announced_sync(label, scope, &[name], result);
+            return;
+        }
+    }
+
+    /// Report a sync of collections the server announced changed (a
+    /// `server_sync`'s, or a follower's: [`Self::follow_skipped`]) under
+    /// `label`: as [`Self::report_background_sync`] does while its connection
+    /// is the live one, and not at all once the client is finished. A sync
+    /// whose connection is gone has its outcome dropped, not its work: what it
+    /// didn't sync goes to the next connection ([`Self::carry_over`]).
+    pub(crate) fn report_announced_sync(
+        self: &Arc<Self>,
+        label: &str,
+        scope: SyncScope,
+        requested: &[WAPatchName],
+        result: Result<BatchedSyncOutcome>,
+    ) {
+        if self.is_terminal() {
+            debug!(target: "Client/AppState", "{label}: outcome dropped, the client is finished");
+            return;
+        }
+        if self.admits(scope).is_err() {
+            let owed = match &result {
+                Ok(outcome) => outcome
+                    .retryable
+                    .iter()
+                    .chain(&outcome.skipped)
+                    .copied()
+                    .collect(),
+                // No buckets to read: everything asked for is owed, as the
+                // report's own error arm has it.
+                Err(_) => requested.to_vec(),
+            };
+            self.carry_over(owed, scope);
+            return;
+        }
+        self.report_background_sync(
+            label,
+            scope,
+            SyncSettles::JustTheCollections,
+            requested,
+            result,
+        );
+    }
+
+    /// Hand `collections`, which the server announced changed, to the next
+    /// connection: their sync's connection is gone before it fetched them.
+    ///
+    /// The server has the announcement's ack and won't make it again, and an
+    /// ordinary reconnect runs no app-state sync, so dropping them would hold
+    /// the change back until the collection's next one. The retry scheduler
+    /// ([`Self::schedule_app_state_retry`]) waits for a usable connection,
+    /// rebinds to it and syncs them there, where any sync began after the
+    /// announcement. Nothing once the client is finished.
+    pub(crate) fn carry_over(self: &Arc<Self>, collections: Vec<WAPatchName>, scope: SyncScope) {
+        if collections.is_empty() {
+            return;
+        }
+        if self.is_terminal() {
+            debug!(target: "Client/AppState", "Not carrying {collections:?} over: the client is finished");
+            return;
+        }
+        debug!(target: "Client/AppState", "{collections:?}: announced on a connection that ended before their sync; carried over to the next");
+        self.schedule_app_state_retry(collections, scope, SyncSettles::JustTheCollections, false);
     }
 
     /// Wait until there is a connection to work on, or the client is finished.
@@ -2606,9 +2960,10 @@ impl Client {
         // Safety cap to prevent infinite loops if the server keeps returning
         // has_more_patches=true without advancing the version (WA Web uses 500).
         let mut pages = Pagination::default();
-        // Every exit below still falls through to `set_version`: the pages
-        // already applied are durable whether or not the rest arrived. Only
-        // what the caller is told changes.
+        // Each page is durable once applied: the processor writes its version
+        // with its rows, so an exit below loses none of the pages before it,
+        // whether or not the rest arrived, and makes no version write of its
+        // own (see the end of the loop). Only what the caller is told changes.
         let mut outcome = SyncOutcome::Completed;
 
         while has_more {

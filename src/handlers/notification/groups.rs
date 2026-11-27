@@ -1,3 +1,4 @@
+use crate::client::Announced;
 use crate::client::Client;
 use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
@@ -42,69 +43,82 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
     }
 
     if !collections.is_empty() {
-        let client_clone = client.clone();
         let generation = client
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
         client
             .runtime
-            .spawn(Box::pin(async move {
-                if client_clone
-                    .connection_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != generation
-                {
-                    log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed");
-                    return;
-                }
-
-                let backend = client_clone.persistence_manager.backend();
-                let mut to_sync = Vec::new();
-                for (name, server_version) in collections {
-                    if server_version > 0 {
-                        match backend.get_version(name.as_str()).await {
-                            Ok(Some(state)) if state.version >= server_version => {
-                                debug!(
-                                    target: "Client/AppState",
-                                    "Skipping server_sync for {:?}: local version {} >= server version {}",
-                                    name, state.version, server_version
-                                );
-                                continue;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(
-                                    target: "Client/AppState",
-                                    "Failed to get local version for {:?}: {e}, syncing anyway",
-                                    name
-                                );
-                            }
-                        }
-                    }
-                    to_sync.push(name);
-                }
-
-                if !to_sync.is_empty() {
-                    if client_clone.is_shutting_down() {
-                        log::debug!(target: "Client/AppState", "Skipping server_sync: client is shutting down");
-                        return;
-                    }
-                    if client_clone
-                        .connection_generation
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != generation
-                    {
-                        log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
-                        return;
-                    }
-                    let scope = client_clone.sync_scope(None);
-                    let sync_fut: BoxFuture<'static, ()> =
-                        Box::pin(run_server_sync_collections(client_clone, to_sync, scope));
-                    sync_fut.await;
-                }
-            }))
+            .spawn(Box::pin(server_sync(
+                client.clone(),
+                collections,
+                generation,
+            )))
             .detach();
     }
+}
+
+/// The `server_sync` task: each collection the notification names whose stored
+/// version is below the one announced (or that names none) is synced, on the
+/// connection `generation` the notification came on. The notification is acked
+/// already, so the server won't announce the change again: a collection whose
+/// connection ended before its sync goes to the next connection
+/// ([`Client::carry_over`]).
+pub(crate) async fn server_sync(
+    client: Arc<Client>,
+    collections: Vec<(WAPatchName, u64)>,
+    generation: u64,
+) {
+    let scope = crate::client::SyncScope {
+        generation,
+        deadline: None,
+    };
+    let backend = client.persistence_manager.backend();
+    let mut to_sync: Vec<(WAPatchName, Announced)> = Vec::new();
+    for (name, server_version) in collections {
+        if server_version > 0 {
+            match backend.get_version(name.as_str()).await {
+                Ok(Some(state)) if state.version >= server_version => {
+                    debug!(
+                        target: "Client/AppState",
+                        "Skipping server_sync for {:?}: local version {} >= server version {}",
+                        name, state.version, server_version
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Failed to get local version for {:?}: {e}, syncing anyway",
+                        name
+                    );
+                }
+            }
+        }
+        let announced = if server_version > 0 {
+            Announced::Version(server_version)
+        } else {
+            Announced::Unversioned
+        };
+        // One entry per collection, with what its children say together: a
+        // notification may repeat a `<collection>` child, and a sync that
+        // follows the one it skips behind has to know the latest.
+        match to_sync.iter_mut().find(|(named, _)| *named == name) {
+            Some((_, earlier)) => *earlier = earlier.merge(announced),
+            None => to_sync.push((name, announced)),
+        }
+    }
+
+    if to_sync.is_empty() {
+        return;
+    }
+    if client.is_shutting_down() || client.admits(scope).is_err() {
+        client.carry_over(to_sync.into_iter().map(|(name, _)| name).collect(), scope);
+        return;
+    }
+    let sync_fut: BoxFuture<'static, ()> =
+        Box::pin(run_server_sync_collections(client, to_sync, scope));
+    sync_fut.await;
 }
 
 /// The heavy half of the `server_sync` task, kept out of the spawned future's
@@ -113,22 +127,29 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
 /// dispatch site awaits this through a boxed `dyn Future`: the no-op path
 /// that only checks versions pays nothing, and the box is allocated solely
 /// when a sync actually runs.
+///
+/// A collection another sync holds is fetched after that sync, unless what it
+/// stored reached the announced version ([`Client::follow_skipped`]); what a
+/// sync whose connection ended didn't fetch goes to the next connection
+/// ([`Client::report_announced_sync`]).
 async fn run_server_sync_collections(
     client: Arc<Client>,
-    to_sync: Vec<WAPatchName>,
+    to_sync: Vec<(WAPatchName, Announced)>,
     scope: crate::client::SyncScope,
 ) {
-    let requested = to_sync.clone();
-    let result = client.sync_collections_batched(to_sync, scope).await;
-    if !client.is_shutting_down() {
-        client.report_background_sync(
-            "app state sync from server_sync",
+    let requested: Vec<WAPatchName> = to_sync.iter().map(|&(name, _)| name).collect();
+    let mut result = client
+        .sync_collections_batched(requested.clone(), scope)
+        .await;
+    let followers = client.follow_skipped(&mut result, &to_sync);
+    client.report_announced_sync("app state sync from server_sync", scope, &requested, result);
+    client
+        .run_followers(
+            followers,
             scope,
-            crate::client::SyncSettles::JustTheCollections,
-            &requested,
-            result,
-        );
-    }
+            "app state sync from server_sync, after the sync it skipped behind",
+        )
+        .await;
 }
 
 /// Handle w:gp2 group notifications.

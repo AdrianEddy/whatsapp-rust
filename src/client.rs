@@ -8,7 +8,7 @@ pub mod bench_retry;
 #[cfg(feature = "bench-harness")]
 pub use app_state::prefetch_bench::{PrefetchCompletionGate, PrefetchHarness};
 pub(crate) use app_state::{
-    AppStateDispatchOutcome, AppStateDownloads, BatchedSyncOutcome, BatchedSyncRequest,
+    Announced, AppStateDispatchOutcome, AppStateDownloads, BatchedSyncOutcome, BatchedSyncRequest,
     CriticalSyncPlan, SyncScope, SyncSettles, fingerprint_id, redact_jid,
 };
 #[cfg(test)]
