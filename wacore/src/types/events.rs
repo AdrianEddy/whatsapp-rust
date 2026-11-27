@@ -2522,7 +2522,9 @@ pub struct Receipt {
 /// Payload of [`Event::ServerAck`]: the server acknowledged (or nacked) an
 /// outgoing stanza. Server acks cover every outgoing stanza class — message,
 /// receipt, notification, call — so consumers should filter on [`class`](Self::class)
-/// before correlating ids.
+/// (and, for receipts, [`type`](Self::type)) before correlating ids: a read
+/// receipt carries the id of the message it reads, as that message's delivery
+/// receipt did.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct ServerAck {
@@ -2531,6 +2533,11 @@ pub struct ServerAck {
     /// Stanza class the ack refers to (`"message"`, `"receipt"`,
     /// `"notification"`, `"call"`, …). `None` when the server omits it.
     pub class: Option<String>,
+    /// The acked stanza's `type`, when the ack carries one: a receipt's
+    /// (`"read"`, `"read-self"`, `"played"`, …), which tells a read receipt's
+    /// ack from the ack of the delivery receipt of the same id (a plain
+    /// delivery receipt has no `type`). `None` when the server omits it.
+    pub r#type: Option<String>,
     /// Chat/entity the ack refers to, when present and parseable.
     pub from: Option<Jid>,
     /// Server timestamp from the ack's `t` attribute, when present. For a

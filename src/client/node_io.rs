@@ -2692,6 +2692,7 @@ impl Client {
             let ack = wacore::types::events::ServerAck::builder()
                 .id(id.as_str().to_string())
                 .maybe_class(node.get_attr("class").map(|v| v.as_str().to_string()))
+                .maybe_type(node.get_attr("type").map(|v| v.as_str().to_string()))
                 // `to_jid`, not `as_str().parse()`: `from` arrives as a JID token,
                 // so the string form is a fresh render that the parse immediately
                 // undoes, and that render also drops the interop `integrator`.
@@ -3039,6 +3040,10 @@ impl Client {
             .update_server_time_offset_at(node, self.runtime.wall_time_secs());
     }
 }
+
+// WF23: an ack keeps the acked stanza's `type`.
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {
