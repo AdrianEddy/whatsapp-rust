@@ -153,6 +153,27 @@ impl Client {
         Ok(())
     }
 
+    /// [`send_node_observed`](Self::send_node_observed) on the socket the
+    /// caller read (`None`: it had none) before it checked its connection: a
+    /// reconnect after that check can't move the stanza to the next
+    /// connection. A missing socket fails after the marshal, as there.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
+    pub(crate) async fn send_node_observed_on(
+        &self,
+        node: Node,
+        observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
+        socket: Option<Arc<NoiseSocket>>,
+    ) -> Result<(), ClientError> {
+        let plaintext = self.marshal_node_for_send(node)?;
+        wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
+        let socket = socket.ok_or(ClientError::NotConnected)?;
+        let receiver = socket
+            .enqueue_send_observed(plaintext.into(), observer)
+            .await?;
+        NoiseSocket::await_send(receiver).await?;
+        Ok(())
+    }
+
     /// Hold the captured socket across enqueue awaits, so a reconnect cannot
     /// publish an old recovery request on the replacement socket.
     pub(crate) async fn send_node_observed_in_scope(

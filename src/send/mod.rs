@@ -3038,6 +3038,13 @@ impl Client {
             ))
             .await?;
         }
+        // The socket the stanza goes on is read before the fence compares the
+        // generation (a scoped send goes on its scope's own). A reconnect moves
+        // the generation before it publishes its socket, so a socket read
+        // before an unchanged generation is this connection's, or none: a
+        // reconnect after the check leaves the stanza on the connection it
+        // began on, never moves it to the next one.
+        let send_socket = self.get_noise_socket().ok();
         if (group_devices.is_some() || requires_connection_generation_check)
             && self
                 .connection_generation
@@ -3045,7 +3052,7 @@ impl Client {
                 != send_generation
         {
             return Err(anyhow::Error::new(ClientError::NotConnected)
-                .context("connection changed while preparing group message"));
+                .context("connection changed while preparing the message"));
         }
         let awaiting_history_ack = history_expected_phash.is_some();
         if let Some(slot) = history_expected_phash {
@@ -3122,7 +3129,10 @@ impl Client {
                 ))
                 .await
             }
-            None => Box::pin(self.send_node_observed(stanza_to_send, send_observer)).await,
+            None => {
+                Box::pin(self.send_node_observed_on(stanza_to_send, send_observer, send_socket))
+                    .await
+            }
         };
         if let Err(e) = send {
             if let Some(msg_id) = ack_message_id {
@@ -3878,7 +3888,11 @@ impl Client {
             recipient_fanout: (!is_status_addon).then_some(prepared.recipient_fanout),
             dm_devices: (!is_status_addon).then_some(dm_devices),
             group_devices: None,
-            requires_connection_generation_check: false,
+            // Fenced to the connection it began on, as a group send is: one
+            // whose connection ended while it waited (the offline drain's end,
+            // a prekey fetch) must not be written on the next connection, where
+            // its caller has already been told the connection was lost.
+            requires_connection_generation_check: true,
             dm_unreached: if is_status_addon {
                 Vec::new()
             } else {
@@ -4232,6 +4246,8 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 mod tests {
     mod action_identity_tests;
     mod creation_tests;
+    // WF26: a 1:1 send stays on the connection it began on.
+    mod mc_tests;
     mod message_reference_tests;
     mod privacy_tokens;
     mod request_tests;
