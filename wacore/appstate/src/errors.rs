@@ -50,6 +50,14 @@ pub enum AppStateError {
     // as SET).
     #[error("unsupported syncd operation {0} in patch")]
     UnsupportedSyncdOperation(i32),
+    /// An action's index was asked for with another number of arguments than
+    /// its schema's non-literal index parts.
+    #[error("index args for action '{action}': expected {expected}, got {got}")]
+    IndexArgs {
+        action: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AppStateError>;

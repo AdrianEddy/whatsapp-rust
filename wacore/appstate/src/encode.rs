@@ -1,7 +1,43 @@
+use crate::AppStateError;
 use crate::hash::generate_content_mac;
 use crate::keys::ExpandedAppStateKeys;
+use crate::schemas::{IndexPart, Schema};
 use wacore_libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
 use waproto::whatsapp as wa;
+
+/// The index of `schema`'s action at `args`, its non-literal index parts in
+/// `schema.index_parts` order, as a mutation of that action is keyed: the
+/// parts, literals included, as a JSON array of strings. This is what
+/// [`encode_record`] takes as `index` and what a record's index MAC covers.
+///
+/// # Errors
+///
+/// [`AppStateError::IndexArgs`] when `args` doesn't hold one argument for each
+/// non-literal part.
+pub fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>, AppStateError> {
+    let expected = schema
+        .index_parts
+        .iter()
+        .filter(|part| !matches!(part, IndexPart::Literal { .. }))
+        .count();
+    if args.len() != expected {
+        return Err(AppStateError::IndexArgs {
+            action: schema.name,
+            expected,
+            got: args.len(),
+        });
+    }
+    let mut args = args.iter();
+    let parts: Vec<&str> = schema
+        .index_parts
+        .iter()
+        .map(|part| match part {
+            IndexPart::Literal { value } => *value,
+            _ => args.next().expect("the argument count was checked above"),
+        })
+        .collect();
+    Ok(serde_json::to_vec(&parts).expect("a list of strings serializes"))
+}
 
 /// Encode and encrypt a mutation into a SyncdRecord.
 ///
@@ -82,6 +118,10 @@ pub fn encode_record(
 
     (mutation, value_mac)
 }
+
+// WF28: `build_action_index`, public.
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

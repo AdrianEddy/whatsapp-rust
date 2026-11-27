@@ -11,7 +11,7 @@ use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
 use anyhow::Result;
 use log::debug;
 use thiserror::Error;
-use wacore::appstate::schemas::{self, IndexPart, Schema};
+use wacore::appstate::schemas::{self, Schema};
 use wacore::types::events::{
     ArchiveUpdate, ClearChatUpdate, ContactRemoved, ContactUpdate, DeleteChatUpdate,
     DeleteMessageForMeUpdate, Event, LockChatUpdate, MarkChatAsReadUpdate, MuteUpdate, PinUpdate,
@@ -524,29 +524,7 @@ fn is_valid_contact_id(jid: &Jid) -> bool {
     jid.is_pn() && jid.device == 0
 }
 
-pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>> {
-    let non_literal = schema
-        .index_parts
-        .iter()
-        .filter(|p| !matches!(p, IndexPart::Literal { .. }))
-        .count();
-    if args.len() != non_literal {
-        anyhow::bail!(
-            "index args for action '{}': expected {non_literal}, got {}",
-            schema.name,
-            args.len()
-        );
-    }
-    let mut parts: Vec<&str> = Vec::with_capacity(schema.index_parts.len());
-    let mut it = args.iter();
-    for part in schema.index_parts {
-        match part {
-            IndexPart::Literal { value } => parts.push(value),
-            _ => parts.push(it.next().expect("arg count checked above")),
-        }
-    }
-    Ok(serde_json::to_vec(&parts)?)
-}
+pub(crate) use wacore::appstate::encode::build_action_index;
 
 /// Access via `client.chat_actions()`.
 pub struct ChatActions<'a> {
@@ -1136,7 +1114,8 @@ impl Client {
         value: &wa::SyncActionValue,
         operation: wa::syncd_mutation::SyncdOperation,
     ) -> Result<(), AppStateError> {
-        let index = build_action_index(schema, index_args)?;
+        let index = build_action_index(schema, index_args)
+            .map_err(|error| AppStateError::Internal(error.into()))?;
         let collection = schema.collection.as_str();
         self.send_app_state_mutation(collection, &index, value, schema.version as i32, operation)
             .await

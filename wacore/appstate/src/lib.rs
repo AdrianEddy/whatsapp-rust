@@ -10,9 +10,10 @@ pub mod schemas;
 pub mod schemas_unlisted;
 
 pub use decode::{
-    Mutation, collect_key_id_refs_from_patch_list, collect_key_ids_from_patch_list, decode_record,
+    Mutation, RecordMacs, collect_key_id_refs_from_patch_list, collect_key_ids_from_patch_list,
+    decode_record, decrypt_record,
 };
-pub use encode::encode_record;
+pub use encode::{build_action_index, encode_record};
 pub use errors::*;
 pub use keys::{ExpandedAppStateKeys, expand_app_state_keys};
 pub use lthash::{LTHash, WAPATCH_INTEGRITY};

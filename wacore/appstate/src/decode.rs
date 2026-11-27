@@ -30,28 +30,24 @@ pub struct RecordMacs {
     pub value_mac: [u8; 32],
 }
 
-/// Decode a single encrypted record into a mutation.
+/// Decrypt a single record: its `SyncActionData` as the device that wrote it
+/// encoded it (the index bytes, the value and the action's version), with its
+/// index and value MACs, its MACs verified when `validate_macs` is set.
 ///
-/// This is a pure, synchronous function that takes the expanded keys directly,
-/// avoiding any async key lookup.
+/// [`decode_record`] is this, with the index parsed: a caller that needs the
+/// action as sent (a primary answering a recovery, say) decrypts once here
+/// rather than decoding and decrypting again.
 ///
-/// # Arguments
-/// * `operation` - The operation type (Set or Remove)
-/// * `record` - The encrypted SyncdRecord to decode
-/// * `keys` - The pre-expanded app state keys for decryption
-/// * `key_id` - The key ID used for MAC validation
-/// * `validate_macs` - Whether to validate MACs during decoding
+/// # Errors
 ///
-/// # Returns
-/// The decoded `Mutation` together with its index/value MACs, or an error if
-/// decoding/validation fails.
-pub fn decode_record(
+/// As [`decode_record`]'s.
+pub fn decrypt_record(
     operation: wa::syncd_mutation::SyncdOperation,
     record: &wa::SyncdRecord,
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     validate_macs: bool,
-) -> Result<(Mutation, RecordMacs), AppStateError> {
+) -> Result<(wa::SyncActionData, RecordMacs), AppStateError> {
     let value_blob = record
         .value
         .blob
@@ -105,13 +101,6 @@ pub fn decode_record(
         validate_index_mac(action.index.as_deref().unwrap_or(&[]), stored, &keys.index)?;
     }
 
-    let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index.as_deref()
-        && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
-    {
-        index_list = parsed;
-    }
-
     // A record without an index MAC is malformed; never persist an empty MAC
     // (previously unwrap_or_default() let this through when validate_macs=false).
     let index_mac = record
@@ -120,17 +109,53 @@ pub fn decode_record(
         .clone()
         .ok_or(AppStateError::MissingIndexMAC)?;
     Ok((
-        Mutation {
-            action_value: action.value.into_option(),
-            index: index_list,
-            operation,
-        },
+        action,
         RecordMacs {
             index_mac,
             value_mac: value_mac
                 .try_into()
                 .expect("split_at leaves exactly the trailing 32 bytes"),
         },
+    ))
+}
+
+/// Decode a single encrypted record into a mutation: [`decrypt_record`], with
+/// the index parsed.
+///
+/// This is a pure, synchronous function that takes the expanded keys directly,
+/// avoiding any async key lookup.
+///
+/// # Arguments
+/// * `operation` - The operation type (Set or Remove)
+/// * `record` - The encrypted SyncdRecord to decode
+/// * `keys` - The pre-expanded app state keys for decryption
+/// * `key_id` - The key ID used for MAC validation
+/// * `validate_macs` - Whether to validate MACs during decoding
+///
+/// # Returns
+/// The decoded `Mutation` together with its index/value MACs, or an error if
+/// decoding/validation fails.
+pub fn decode_record(
+    operation: wa::syncd_mutation::SyncdOperation,
+    record: &wa::SyncdRecord,
+    keys: &ExpandedAppStateKeys,
+    key_id: &[u8],
+    validate_macs: bool,
+) -> Result<(Mutation, RecordMacs), AppStateError> {
+    let (action, macs) = decrypt_record(operation, record, keys, key_id, validate_macs)?;
+    let mut index_list: Vec<String> = Vec::new();
+    if let Some(idx_bytes) = action.index.as_deref()
+        && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
+    {
+        index_list = parsed;
+    }
+    Ok((
+        Mutation {
+            action_value: action.value.into_option(),
+            index: index_list,
+            operation,
+        },
+        macs,
     ))
 }
 
@@ -182,6 +207,10 @@ pub fn collect_key_id_refs_from_patch_list<'a>(
 
     key_ids
 }
+
+// WF28: `decrypt_record`, public.
+#[cfg(test)]
+mod mc_tests;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
