@@ -2100,22 +2100,7 @@ where
     // and `history_lid_mapping` still validates both halves in full before a
     // pair is emitted.
     let chat_jid = wacore_binary::jid::parse_jid_ref(chat_id);
-    let pn_jid = pn_jid.or_else(|| {
-        chat_jid
-            .as_ref()
-            .filter(|jid| jid.server.is_pn_family())
-            .map(|_| chat_id)
-    });
-    let lid_jid = lid_jid.or_else(|| {
-        chat_jid
-            .as_ref()
-            .filter(|jid| jid.server.is_lid_family())
-            .map(|_| chat_id)
-    });
-    if let (Some(pn_jid), Some(lid_jid)) = (pn_jid, lid_jid)
-        && let Some(mapping) =
-            history_lid_mapping(pn_jid, lid_jid, HistoryLidMappingSource::Conversation)
-    {
+    if let Some(mapping) = conversation_pair(chat_id, chat_jid.as_ref(), pn_jid, lid_jid) {
         lid_mappings.push(mapping);
     }
 
@@ -2144,6 +2129,97 @@ where
         tc_token_timestamp: tc_token_timestamp?,
         tc_token_sender_timestamp,
     })
+}
+
+/// The PN↔LID pair of a conversation whose id is `chat_id` (parsed as
+/// `chat_jid`) and whose `pnJid` and `lidJid` fields are `pn_jid` and `lid_jid`:
+/// the id supplies the half of its own namespace, so a conversation named by
+/// number with its `lidJid`, or by LID with its `pnJid`, is a complete pair.
+/// Both halves are validated in full ([`history_lid_mapping`]).
+fn conversation_pair(
+    chat_id: &str,
+    chat_jid: Option<&wacore_binary::jid::JidRef<'_>>,
+    pn_jid: Option<&str>,
+    lid_jid: Option<&str>,
+) -> Option<HistoryLidMapping> {
+    let pn_jid = pn_jid.or_else(|| {
+        chat_jid
+            .filter(|jid| jid.server.is_pn_family())
+            .map(|_| chat_id)
+    })?;
+    let lid_jid = lid_jid.or_else(|| {
+        chat_jid
+            .filter(|jid| jid.server.is_lid_family())
+            .map(|_| chat_id)
+    })?;
+    history_lid_mapping(pn_jid, lid_jid, HistoryLidMappingSource::Conversation)
+}
+
+/// The PN↔LID pair a history conversation names itself, read from its encoded
+/// bytes (one `HistorySync.conversations` entry, as
+/// [`HistorySyncStream::next_conversation_bytes`] yields it) as the stream's own
+/// processing reads it into [`HistorySyncResult::lid_mappings`] under
+/// [`HistoryLidMappingSource::Conversation`]: its id with its `lidJid` (named by
+/// number), or its `pnJid` with its id (named by LID), the id supplying the half
+/// of its own namespace.
+///
+/// Only the conversation's top-level fields are read, the last of each kept as
+/// a decode keeps it; its messages are skipped by their length, never decoded,
+/// so a host that reads the pairs of a chunk's conversations before importing
+/// them decodes no message twice. A field that breaks the framing ends the walk
+/// there, keeping what came before it, as the stream does.
+///
+/// `None` when the conversation names no complete pair (a group, one named by
+/// number without its `lidJid`), a half isn't a JID of its namespace, or its
+/// id isn't text.
+pub fn conversation_lid_mapping(conversation: &[u8]) -> Option<HistoryLidMapping> {
+    let mut pos = 0;
+    let mut chat_id = "";
+    let mut pn_jid = None;
+    let mut lid_jid = None;
+    while pos < conversation.len() {
+        let Some((tag, read)) = read_varint(&conversation[pos..]) else {
+            break;
+        };
+        pos += read;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x7) as u32;
+        match (field, wire) {
+            (tags::conversation::ID, wire_type::LENGTH_DELIMITED) => {
+                let Some((len, read)) = read_varint(&conversation[pos..]) else {
+                    break;
+                };
+                pos += read;
+                let Some(end) = checked_end(pos, len, conversation.len()) else {
+                    break;
+                };
+                // An id that isn't text makes the conversation malformed: the
+                // stream names no pair for it either.
+                chat_id = smoothutf8::from_utf8(&conversation[pos..end])?;
+                pos = end;
+            }
+            (tags::conversation::PN_JID, wire_type::LENGTH_DELIMITED) => {
+                match read_optional_str_field(conversation, &mut pos) {
+                    OptionalStr::Value(value) => pn_jid = Some(value),
+                    OptionalStr::Unusable => {}
+                    OptionalStr::Malformed => break,
+                }
+            }
+            (tags::conversation::LID_JID, wire_type::LENGTH_DELIMITED) => {
+                match read_optional_str_field(conversation, &mut pos) {
+                    OptionalStr::Value(value) => lid_jid = Some(value),
+                    OptionalStr::Unusable => {}
+                    OptionalStr::Malformed => break,
+                }
+            }
+            _ => match skip_field(wire, conversation, pos) {
+                Ok(next) => pos = next,
+                Err(_) => break,
+            },
+        }
+    }
+    let chat_jid = wacore_binary::jid::parse_jid_ref(chat_id);
+    conversation_pair(chat_id, chat_jid.as_ref(), pn_jid, lid_jid)
 }
 
 /// Extract a single message's secret record (if any) into `out`.
@@ -2357,6 +2433,11 @@ pub struct TcTokenCandidate {
 /// token at 16-24 bytes; 32 keeps headroom without growing the candidate past
 /// what the id beside it already costs.
 pub const TC_TOKEN_INLINE: usize = 32;
+
+// WF29: `conversation_lid_mapping`, public.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod mc_tests;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
