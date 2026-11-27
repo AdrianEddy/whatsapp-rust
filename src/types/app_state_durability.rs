@@ -50,9 +50,16 @@ pub use wacore::appstate_sync::{AppStateBatch, AppStateBatchKind};
 /// Implementations must commit before returning `Ok` and be idempotent: a
 /// crash between the host's commit and the cursor's, a sync retried after a
 /// later failure, a rebuild or a repeated recovery all offer the same
-/// mutations again. Last-writer-wins on `SyncActionValue::timestamp` makes a
-/// replay a no-op. A future dropped before it completes is an indeterminate
-/// commit, which that replay settles.
+/// mutations again. Keeping each index at its greatest mutation in the
+/// collection's own order makes a replay a no-op: the batch's `version` first,
+/// then within one batch a SET over a REMOVE of the index, then the later
+/// `SyncActionValue::timestamp`. The action timestamp alone is no order: the
+/// server orders a collection by version, a patch the server refused is sent
+/// again unchanged on its new head (so a later version can carry an earlier
+/// timestamp), and a REMOVE need not carry one. A whole-collection batch at
+/// `version` V also stands for every batch of the collection at or below V, so
+/// one of those that arrives after it changes nothing. A future dropped before
+/// it completes is an indeterminate commit, which that replay settles.
 ///
 /// The hook is awaited inside the sync, with the collection reserved, so a
 /// slow hook holds up that collection and the sync work queued behind it. Do
