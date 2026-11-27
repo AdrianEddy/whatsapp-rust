@@ -466,24 +466,33 @@ impl Drop for ReinsertGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PendingCommitOutcome {
-    persisted: bool,
-    delivered: bool,
+/// How far a pending batch's commit got.
+enum PendingCommitOutcome {
+    /// Nothing persisted, for this reason (a drain batch is back in the
+    /// batcher for a retry).
+    Failed(anyhow::Error),
+    /// Durable but not acknowledged: a history carrier's capture, the hook or
+    /// the rows' cleanup failed, and a redelivery or replay finishes it.
+    Buffered,
+    /// Durable and published, and acknowledged when the caller asked.
+    Delivered,
 }
 impl PendingCommitOutcome {
-    const FAILED: Self = Self {
-        persisted: false,
-        delivered: false,
-    };
-    const BUFFERED: Self = Self {
-        persisted: true,
-        delivered: false,
-    };
-    const DELIVERED: Self = Self {
-        persisted: true,
-        delivered: true,
-    };
+    fn persisted(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+
+    fn delivered(&self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+
+    /// `Ok` when the batch was persisted, else why it wasn't.
+    fn into_result(self) -> anyhow::Result<()> {
+        match self {
+            Self::Failed(error) => Err(error),
+            Self::Buffered | Self::Delivered => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1161,7 +1170,7 @@ impl Client {
             anyhow::ensure!(
                 self.commit_pending_batch_result(retained.into(), BatchOrigin::Live, None, false)
                     .await
-                    .delivered,
+                    .delivered(),
                 "retained producer has not recovered before decrypt"
             );
         }
@@ -1199,7 +1208,7 @@ impl Client {
         anyhow::ensure!(
             self.commit_pending_batch_result(predecessor.into(), BatchOrigin::Live, None, false)
                 .await
-                .delivered,
+                .delivered(),
             "predecessor hook has not recovered before decrypt"
         );
         Ok(())
@@ -1378,16 +1387,16 @@ impl Client {
             let outcome = self
                 .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
                 .await;
-            if durable && !outcome.delivered {
+            if durable && !outcome.delivered() {
                 for item in items.iter() {
                     self.inbound_commit_batch
                         .live_retention
                         .fail_receipt(&item.info);
                 }
             }
-            return if outcome.delivered {
+            return if outcome.delivered() {
                 InboundCommitState::Durable
-            } else if outcome.persisted {
+            } else if outcome.persisted() {
                 InboundCommitState::Buffered
             } else {
                 InboundCommitState::Failed
@@ -1498,12 +1507,33 @@ impl Client {
     /// Returns whether the drain state is durable (see
     /// [`commit_inbound_batch`](Self::commit_inbound_batch)); callers gate the
     /// buffered offline-receipt flush on it.
-    pub(crate) async fn flush_inbound_commits_under_permit(
+    pub(crate) fn flush_inbound_commits_under_permit(
         self: &Arc<Self>,
         deactivate: bool,
         expected_epoch: Option<u64>,
         expected_generation: Option<u64>,
-    ) -> bool {
+    ) -> impl Future<Output = bool> + '_ {
+        // The result's future itself, mapped: no frame of its own on paths
+        // whose futures are size-pinned (the keepalive loop's teardown).
+        futures::FutureExt::map(
+            self.flush_inbound_commits_under_permit_result(
+                deactivate,
+                expected_epoch,
+                expected_generation,
+            ),
+            |committed| committed.is_ok(),
+        )
+    }
+
+    /// [`Self::flush_inbound_commits_under_permit`], with the commit's failure
+    /// when the drain state isn't durable: the store's error (the host's inside
+    /// it) or the journal's admission, for a caller that reports it.
+    pub(crate) async fn flush_inbound_commits_under_permit_result(
+        self: &Arc<Self>,
+        deactivate: bool,
+        expected_epoch: Option<u64>,
+        expected_generation: Option<u64>,
+    ) -> anyhow::Result<()> {
         let _permits = self.acquire_message_quiescence().await;
         if let Some(generation) = expected_generation
             && self.connection_generation.load(Ordering::Acquire) != generation
@@ -1511,18 +1541,18 @@ impl Client {
             // A reconnect reset the batcher while this (drain-finisher) call
             // waited for the permit; the new connection owns the state now, so
             // touching it here would take/deactivate the NEW drain.
-            return true;
+            return Ok(());
         }
         if let Some(epoch) = expected_epoch
             && self.inbound_commit_batch.epoch.load(Ordering::Acquire) != epoch
         {
             // Another flush took this sleeper's batch while it waited for the
             // permit; whatever accumulates now belongs to a newer timer.
-            return true;
+            return Ok(());
         }
         let was_draining = self.inbound_commit_batch.is_active();
         let batch = self.inbound_commit_batch.take();
-        let durable = if batch.is_empty() {
+        let committed = if batch.is_empty() {
             // Even with nothing to commit, flush the Signal cache under the
             // permit. While draining this persists SKDM-only advances (stanzas
             // that mutate Signal state without enqueueing a message), whose
@@ -1534,15 +1564,18 @@ impl Client {
             // permit, the SAME flush persists that caller's advance instead of
             // silently no-oping, so is_active() never has to stand in for "was
             // flushed". Idempotent and cheap when the cache is already clean.
-            self.drain_signal_flush_reporting().await
+            self.drain_signal_flush_result().await
         } else {
-            self.commit_pending_batch(
+            self.commit_pending_batch_result(
                 batch.entries.into(),
                 BatchOrigin::OfflineDrain,
                 batch.commit_ticket,
+                true,
             )
             .await
+            .into_result()
         };
+        let durable = committed.is_ok();
         if let Some(generation) = expected_generation
             && self.connection_generation.load(Ordering::Acquire) != generation
         {
@@ -1551,7 +1584,7 @@ impl Client {
             // so mutating the mode now would deactivate (or defer) the NEW
             // connection's drain. The commit itself was still sound — its
             // entries were taken before the reset and its rows are durable.
-            return durable;
+            return committed;
         }
         if durable {
             self.flush_offline_receipts();
@@ -1575,7 +1608,7 @@ impl Client {
         } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
             self.complete_deferred_live_transition();
         }
-        durable
+        committed
     }
 
     /// Finish a drain→live transition that a failed end-of-drain tail commit
@@ -1763,24 +1796,25 @@ impl Client {
     /// because an SKDM receipt must never be sent while its sender-key state
     /// is only in the cache. On failure the cache keeps its dirty entries for
     /// a later retry.
-    async fn drain_signal_flush_reporting(&self) -> bool {
+    fn drain_signal_flush_reporting(&self) -> impl Future<Output = bool> + '_ {
+        futures::FutureExt::map(self.drain_signal_flush_result(), |flushed| flushed.is_ok())
+    }
+
+    /// [`Self::drain_signal_flush_reporting`], with the flush's failure.
+    async fn drain_signal_flush_result(&self) -> anyhow::Result<()> {
         #[cfg(test)]
         if self
             .inbound_commit_batch
             .fail_flushes
             .load(Ordering::Acquire)
         {
-            return false;
+            return Err(anyhow::anyhow!("a test's injected flush failure"));
         }
-        match self.flush_signal_cache().await {
-            Ok(()) => true,
-            Err(e) => {
-                log::error!(
-                    "Failed to flush signal cache (commit_batch): {e:?}; holding buffered receipts for redelivery"
-                );
-                false
-            }
-        }
+        self.flush_signal_cache().await.inspect_err(|e| {
+            log::error!(
+                "Failed to flush signal cache (commit_batch): {e:?}; holding buffered receipts for redelivery"
+            );
+        })
     }
 
     /// Commit any accumulated entries while the caller ALREADY HOLDS the full
@@ -2007,7 +2041,7 @@ impl Client {
     ) -> bool {
         self.commit_pending_batch_result(items, origin, commit_ticket, true)
             .await
-            .persisted
+            .persisted()
     }
 
     pub(super) async fn replay_pending_batch(
@@ -2017,7 +2051,7 @@ impl Client {
     ) -> bool {
         self.commit_pending_batch_result(items, BatchOrigin::Live, None, acknowledge)
             .await
-            .delivered
+            .delivered()
     }
 
     async fn commit_pending_batch_result(
@@ -2044,7 +2078,7 @@ impl Client {
         debug_assert!(is_drain || commit_ticket.is_none());
         if items.is_empty() {
             debug_assert!(commit_ticket.is_none());
-            return PendingCommitOutcome::DELIVERED;
+            return PendingCommitOutcome::Delivered;
         }
         // A drain can accumulate two deliveries of one message before the batch
         // commits: both read the gate before either claim landed, so the
@@ -2065,7 +2099,9 @@ impl Client {
                 let mut entry = entry.clone();
                 if let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut entry) {
                     log::warn!("Producer recovery admission refused: {error:?}");
-                    return PendingCommitOutcome::FAILED;
+                    return PendingCommitOutcome::Failed(
+                        error.context("producer recovery admission refused"),
+                    );
                 }
             }
         }
@@ -2088,7 +2124,9 @@ impl Client {
             .fail_commits
             .load(Ordering::Acquire)
         {
-            return PendingCommitOutcome::FAILED;
+            return PendingCommitOutcome::Failed(anyhow::anyhow!(
+                "a test's injected commit failure"
+            ));
         }
 
         // Persist every arrived physical key before collapsing consumer aliases.
@@ -2125,7 +2163,9 @@ impl Client {
                 Ok(stored) => stored,
                 Err(error) => {
                     log::error!("Failed to buffer inbound occurrence group: {error:?}");
-                    return PendingCommitOutcome::FAILED;
+                    return PendingCommitOutcome::Failed(
+                        error.context("failed to buffer the inbound batch"),
+                    );
                 }
             };
             if dispatch_gate {
@@ -2149,8 +2189,8 @@ impl Client {
             // entries make the batch retryable THIS session — the retry
             // re-runs the full commit (rows → flush → hook → event → cleanup → ACK)
             // instead of parking the messages until a reconnect replay.
-            if is_drain && !self.drain_signal_flush_reporting().await {
-                return PendingCommitOutcome::FAILED;
+            if is_drain && let Err(error) = self.drain_signal_flush_result().await {
+                return PendingCommitOutcome::Failed(error);
             }
             // Rows durable and Signal flushed: from here on a cancelled
             // future must not restore the entries — redelivery replays from
@@ -2175,7 +2215,7 @@ impl Client {
                         Box::pin(self.commit_history_sync_carrier(&delivery.info, carrier.clone()));
                     if let Err(error) = history_commit.await {
                         log::warn!("History sync durability failed; withholding ACK: {error:?}");
-                        return PendingCommitOutcome::BUFFERED;
+                        return PendingCommitOutcome::Buffered;
                     }
                 }
             }
@@ -2188,7 +2228,7 @@ impl Client {
                         "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
                         items.len()
                     );
-                    return PendingCommitOutcome::BUFFERED;
+                    return PendingCommitOutcome::Buffered;
                 }
             }
             hook_committed = self.inbound_durability_hook.get().is_some();
@@ -2196,15 +2236,15 @@ impl Client {
             // A commit covering only a subset cannot delete prior failed
             // occurrences. Redelivery replays the complete retained group.
             if stored.iter().any(|row| !row.complete) {
-                return PendingCommitOutcome::BUFFERED;
+                return PendingCommitOutcome::Buffered;
             }
             cleanup = Some(stored);
         } else {
             drop(deliveries);
             // No hook = at-most-once: the flush is the durable point, so a
             // failure restores the entries (guard still armed) for a retry.
-            if is_drain && !self.drain_signal_flush_reporting().await {
-                return PendingCommitOutcome::FAILED;
+            if is_drain && let Err(error) = self.drain_signal_flush_result().await {
+                return PendingCommitOutcome::Failed(error);
             }
         }
 
@@ -2274,7 +2314,7 @@ impl Client {
             self.inbound_commit_batch.live_retention.published(&pending);
             if let Err(error) = self.cleanup_pending_group(rows, Arc::clone(&pending)).await {
                 log::warn!("Pending occurrence cleanup conflict; suppressing ACK: {error:?}");
-                return PendingCommitOutcome::BUFFERED;
+                return PendingCommitOutcome::Buffered;
             }
         }
         // The no-hook path still schedules receipts before synchronous
@@ -2302,7 +2342,7 @@ impl Client {
             pending.iter().map(|item| &item.info),
             false,
         );
-        PendingCommitOutcome::DELIVERED
+        PendingCommitOutcome::Delivered
     }
 
     #[inline(never)]
@@ -2510,7 +2550,7 @@ mod tests {
                 .await
                 .expect("public mapping must finish while the hook owns the drain permit")
                 .unwrap();
-            assert!(outcome.persisted && outcome.delivered);
+            assert!(outcome.persisted() && outcome.delivered());
             assert!(
                 client
                     .lid_pn_cache
@@ -2588,8 +2628,8 @@ mod tests {
             .await
             .expect("hook lookup must finish while it owns the drain permit")
             .unwrap();
-        assert!(outcome.persisted);
-        assert_eq!(outcome.delivered, !(recovery || reset));
+        assert!(outcome.persisted());
+        assert_eq!(outcome.delivered(), !(recovery || reset));
         if recovery || reset {
             assert_eq!(
                 client.cached_adv_account_identity(&user).await.unwrap(),
@@ -2690,8 +2730,8 @@ mod tests {
                                 true,
                             )
                             .await;
-                        assert!(outcome.persisted);
-                        Ok(outcome.delivered)
+                        assert!(outcome.persisted());
+                        Ok(outcome.delivered())
                     } else {
                         client.refresh_user_devices(users).await.map(|_| true)
                     }
@@ -3008,7 +3048,7 @@ mod tests {
                     false
                 )
                 .await
-                .delivered
+                .delivered()
         );
         let event = rx.try_recv().unwrap();
         let Event::Messages(batch) = event.as_ref() else {
@@ -3024,7 +3064,7 @@ mod tests {
             client
                 .commit_pending_batch_result(vec![part(2)].into(), BatchOrigin::Live, None, false)
                 .await
-                .delivered
+                .delivered()
         );
         let event = rx.try_recv().unwrap();
         let Event::Messages(batch) = event.as_ref() else {
@@ -3081,8 +3121,8 @@ mod tests {
                     true,
                 )
                 .await;
-            assert!(outcome.persisted);
-            assert!(!outcome.delivered);
+            assert!(outcome.persisted());
+            assert!(!outcome.delivered());
             assert!(
                 backend
                     .get_pending_inbound("100@g.us", "200:75@s.whatsapp.net", "ALIAS_PARTIAL")
@@ -3230,8 +3270,8 @@ mod tests {
                 drop(client.inbound_commit_batch.pending_storage.lock().await);
             } else {
                 let outcome = worker.await.unwrap();
-                assert!(!outcome.delivered);
-                assert_eq!(outcome.persisted, boundary != "replace");
+                assert!(!outcome.delivered());
+                assert_eq!(outcome.persisted(), boundary != "replace");
                 // Both failures leave an ambiguous physical pair. Recovery must
                 // use the exact revisions it already owns, before alias lookup.
                 backend.set_fail_pending_delete(None);
@@ -3420,8 +3460,8 @@ mod tests {
                     true,
                 )
                 .await;
-            assert!(outcome.persisted);
-            assert!(!outcome.delivered);
+            assert!(outcome.persisted());
+            assert!(!outcome.delivered());
             let event = rx
                 .try_recv()
                 .expect("a cleanup conflict cannot erase the hook commit");
@@ -3448,7 +3488,7 @@ mod tests {
             let retry = client
                 .commit_pending_batch_result(entries, BatchOrigin::Live, None, true)
                 .await;
-            assert!(!retry.delivered);
+            assert!(!retry.delivered());
             assert_eq!(
                 backend
                     .get_pending_inbound("100@g.us", "200@s.whatsapp.net", ids[failed_index])
@@ -3600,9 +3640,9 @@ mod tests {
                     true,
                 )
                 .await;
-            assert!(outcome.persisted);
+            assert!(outcome.persisted());
             assert!(
-                !outcome.delivered,
+                !outcome.delivered(),
                 "unfinished cleanup must not authorize ACK"
             );
             assert_eq!(hook.batches.lock().unwrap()[0], ids);
@@ -3705,8 +3745,8 @@ mod tests {
                     false,
                 )
                 .await;
-            assert!(outcome.persisted);
-            assert_eq!(outcome.delivered, after_commit);
+            assert!(outcome.persisted());
+            assert_eq!(outcome.delivered(), after_commit);
             assert_eq!(hook.batches.lock().unwrap().len(), 1);
             assert!(rx.try_recv().is_ok(), "the hook committed before cleanup");
             assert!(rx.try_recv().is_err());
@@ -3761,7 +3801,7 @@ mod tests {
                 false,
             )
             .await;
-        assert!(outcome.persisted && !outcome.delivered);
+        assert!(outcome.persisted() && !outcome.delivered());
         assert!(
             backend
                 .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "LEGACY_REUSE")
@@ -3816,7 +3856,7 @@ mod tests {
                 false,
             )
             .await;
-        assert!(outcome.delivered);
+        assert!(outcome.delivered());
         let backend = client.persistence_manager.backend();
         for sender in ["200@s.whatsapp.net", "200:75@s.whatsapp.net"] {
             assert!(
@@ -3899,7 +3939,7 @@ mod tests {
                 false,
             )
             .await;
-        assert!(outcome.delivered);
+        assert!(outcome.delivered());
         assert_eq!(
             *hook.batches.lock().unwrap(),
             vec![vec!["CLAIMED_FIRST".to_owned()]]

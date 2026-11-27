@@ -2209,6 +2209,19 @@ async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
 /// learned after that snapshot must still reject replay without resetting it.
 #[tokio::test]
 async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
+    ordinary_recovery_rejects_a_changed_alias(false).await;
+}
+
+/// WF25: a different alias learned while recovery waits for the candidate's
+/// lock is refused by the recheck under the locks, before the IQ.
+#[tokio::test]
+async fn ordinary_recovery_rejects_an_alias_changed_while_it_takes_its_locks() {
+    ordinary_recovery_rejects_a_changed_alias(true).await;
+}
+
+/// The phone gains another alias in the primary IQ's reply, or (`while_locking`)
+/// while recovery waits for the candidate's lock.
+async fn ordinary_recovery_rejects_a_changed_alias(while_locking: bool) {
     use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
     // This checkpoint excludes database scheduling as a source of Pending:
     // the warmed session locks and immediate in-memory reads leave only the
@@ -2270,13 +2283,26 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
         transport.sent().is_empty(),
         "the missing candidate lock must precede the IQ"
     );
-    drop(alias_guard);
     let changed_alias = Jid::lid("100000000000194");
+    if while_locking {
+        client
+            .lid_pn_cache
+            .add(&crate::lid_pn_cache::LidPnEntry::new(
+                changed_alias.user.to_string(),
+                phone.user.to_string(),
+                crate::lid_pn_cache::LearningSource::Usync,
+            ))
+            .await;
+    }
+    drop(alias_guard);
     let changed_lock = client
         .session_lock_for(changed_alias.to_protocol_address().as_str())
         .await;
     let changed_guard = changed_lock.lock_arc().await;
     let reply = async {
+        if while_locking {
+            return;
+        }
         let iq = decode_sent_iq(&transport, 0).await;
         client
             .lid_pn_cache
@@ -2299,6 +2325,18 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
         error.to_string().contains("account alias changed"),
         "{error:#}"
     );
+    // WF25: a race the caller reads by type, and retries.
+    assert_eq!(
+        error.downcast_ref::<crate::client::ConcurrentChange>(),
+        Some(&crate::client::ConcurrentChange::AccountAlias),
+        "{error:#}"
+    );
+    if while_locking {
+        assert!(
+            transport.sent().is_empty(),
+            "the recheck under the locks refuses it before the IQ"
+        );
+    }
     assert!(has_session(&client, &lid.to_protocol_address()).await);
     assert_eq!(
         client.cached_adv_account_identity(&lid).await.unwrap(),
@@ -2313,6 +2351,74 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
         Some(changed_alias)
     );
     drop(changed_guard);
+    client.signal_shutdown_sync();
+}
+
+/// WF25: an alias that changes again under every attempt to lock it runs the
+/// identity guards out of attempts, as the race a caller reads by type.
+#[tokio::test]
+async fn identity_guards_give_up_on_an_alias_that_keeps_changing_while_they_lock() {
+    // In-memory reads: a poll of the guards stops only at a lock the test holds.
+    let (client, transport) = crate::test_utils::create_iq_test_client_with_backend(Arc::new(
+        wacore::store::in_memory::InMemoryBackend::new(),
+    ))
+    .await;
+    let phone = Jid::pn("12025550196");
+    // The alias each attempt reads, then the one the phone has by the time
+    // that attempt holds the alias's lock.
+    let aliases: Vec<_> = (0..=DEVICE_REFRESH_MAX_ATTEMPTS)
+        .map(|attempt| Jid::lid(format!("10000000000019{}", 6 + attempt)))
+        .collect();
+    let mapping = |alias: &Jid| {
+        crate::lid_pn_cache::LidPnEntry::new(
+            alias.user.to_string(),
+            phone.user.to_string(),
+            crate::lid_pn_cache::LearningSource::Usync,
+        )
+    };
+    client.lid_pn_cache.add(&mapping(&aliases[0])).await;
+    let mut locks = Vec::with_capacity(aliases.len());
+    for alias in &aliases {
+        locks.push(
+            client
+                .session_lock_for(alias.to_protocol_address().as_str())
+                .await,
+        );
+    }
+    let primary_lock = client
+        .session_lock_for(phone.to_protocol_address().as_str())
+        .await;
+    assert!(wacore::types::jid::cmp_for_lock_order(&phone, &aliases[0]).is_lt());
+    let mut held = locks[0].lock_arc().await;
+    let mut guards =
+        std::pin::pin!(client.device_list_identity_guards(std::slice::from_ref(&phone)));
+    for attempt in 1..=DEVICE_REFRESH_MAX_ATTEMPTS {
+        assert!(futures::poll!(guards.as_mut()).is_pending());
+        assert!(
+            primary_lock.try_lock().is_none(),
+            "attempt {attempt} holds the phone's lock while it waits for its alias's"
+        );
+        // The alias changes while the attempt waits; the next alias's lock is
+        // held before this one is let go.
+        client.lid_pn_cache.add(&mapping(&aliases[attempt])).await;
+        let next = locks[attempt].lock_arc().await;
+        drop(std::mem::replace(&mut held, next));
+    }
+    let error = guards
+        .await
+        .err()
+        .expect("every attempt saw the alias change under its locks");
+    assert_eq!(
+        error.downcast_ref::<crate::client::ConcurrentChange>(),
+        Some(&crate::client::ConcurrentChange::AccountAlias),
+        "{error:#}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "account aliases changed during ADV lock acquisition"
+    );
+    assert!(transport.sent().is_empty());
+    drop(held);
     client.signal_shutdown_sync();
 }
 
@@ -4186,12 +4292,16 @@ async fn companion_bootstrap_waits_for_publication_and_checks_the_known_alias() 
         assert_migration_publication(&client, &pn, &devices).await;
         let outcome = bootstrap.await;
         if conflicting {
+            let error = outcome.err().unwrap();
             assert!(
-                outcome
-                    .err()
-                    .unwrap()
+                error
                     .to_string()
                     .contains("primary identity changed during companion bootstrap")
+            );
+            // WF25: a race the caller reads by type, and retries.
+            assert_eq!(
+                error.downcast_ref::<crate::client::ConcurrentChange>(),
+                Some(&crate::client::ConcurrentChange::PrimaryIdentity)
             );
             assert_eq!(
                 client.cached_adv_account_identity(&lid).await.unwrap(),

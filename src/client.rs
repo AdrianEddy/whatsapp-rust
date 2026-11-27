@@ -1507,11 +1507,13 @@ pub enum SignalMaintenanceError {
     #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
     /// The inbound drain batch could not be committed, so the Signal cache was
-    /// left unflushed on purpose and the server redelivers those messages.
+    /// left unflushed on purpose and the server redelivers those messages. The
+    /// source is the commit's own failure: the store's write or flush (the
+    /// host's error inside it), or the journal's admission.
     #[error(
         "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
     )]
-    DrainCommitFailed,
+    DrainCommitFailed(#[source] anyhow::Error),
     /// The client is going away while an inbound drain is active; flushing
     /// there would persist ratchet advances whose messages have no durable row.
     #[error("client dropping while inbound drain is active; skipping Signal flush")]
@@ -1538,6 +1540,35 @@ impl ConnectError {
             | ConnectError::Transport(_) => false,
         }
     }
+}
+
+/// Work the client began lost a race with a concurrent change of the state it
+/// was built on, and gave up rather than build on what it read before. Nothing
+/// went out for it, and the same call made again starts from the new state, so
+/// it is worth retrying, at once or after a short wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConcurrentChange {
+    /// The device registry kept changing while a group's device refresh was
+    /// in flight.
+    #[error("device registry kept changing while a group refresh was in flight")]
+    GroupDeviceRefresh,
+    /// The device registry kept changing while an authoritative device refresh
+    /// was in flight.
+    #[error("device registry kept changing while an authoritative refresh was in flight")]
+    DeviceRefresh,
+    /// An account's alias (its LID or phone number) changed during the
+    /// companion bootstrap's recovery of a device list, or while its locks were
+    /// taken.
+    #[error("account alias changed during ADV recovery")]
+    AccountAlias,
+    /// A primary device's identity changed during the companion bootstrap.
+    #[error("primary identity changed during companion bootstrap")]
+    PrimaryIdentity,
+    /// Every caller that led the establishment of a session gave it up before
+    /// it reached this caller's addresses.
+    #[error("session establishment was abandoned by successive callers")]
+    SessionEstablishment,
 }
 
 impl ClientError {

@@ -8123,6 +8123,49 @@ mod ensure_sessions_concurrency {
             .expect("a waiter must establish the session its leader failed to");
     }
 
+    /// WF25: a waiter whose leaders all give its address up, one after another
+    /// for each of its passes, gives up too, as the race a caller reads by type
+    /// and retries: nothing was fetched for it.
+    #[tokio::test]
+    async fn a_waiter_every_leader_abandons_ends_as_a_concurrent_change() {
+        // `ensure_sessions_inner`'s passes.
+        const PASSES: usize = 3;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("121212121212121".to_string(), 0);
+        // Polled only here, so each next leader claims the address before the
+        // waiter looks at it again.
+        let mut waiter =
+            std::pin::pin!(client.ensure_e2e_sessions_resolved(std::slice::from_ref(&peer)));
+        for pass in 0..PASSES {
+            let leader = {
+                let client = client.clone();
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    client
+                        .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                        .await
+                })
+            };
+            pending_prekey_request(&transport, pass).await;
+            assert!(futures::poll!(waiter.as_mut()).is_pending());
+            assert_eq!(
+                transport.sent().len(),
+                pass + 1,
+                "the waiter defers to leader {pass}, it doesn't fetch"
+            );
+            leader.abort();
+            assert!(leader.await.unwrap_err().is_cancelled());
+        }
+        let error = waiter.await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ConcurrentChange>(),
+            Some(&ConcurrentChange::SessionEstablishment),
+            "{error:#}"
+        );
+        assert_eq!(prekey_requests(&transport).await, PASSES);
+        assert_eq!(client.ensure_inflight.len(), 0);
+    }
+
     /// A batch that overlaps an in-flight address still resolves the rest of
     /// its devices, and does not re-fetch the one already being established.
     #[tokio::test]

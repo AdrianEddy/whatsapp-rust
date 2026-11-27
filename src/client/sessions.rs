@@ -934,11 +934,13 @@ impl Client {
         // Reported, not swallowed: before coalescing, this caller would have
         // run its own fetch and propagated whatever that returned. Succeeding
         // here would hand the fan-out an address nobody ever fetched for.
-        Err(anyhow::anyhow!(
-            "session establishment for {} address(es) was abandoned by \
+        Err(
+            anyhow::Error::new(super::ConcurrentChange::SessionEstablishment).context(format!(
+                "session establishment for {} address(es) was abandoned by \
              {ENSURE_PASSES} successive callers",
-            jids.len()
-        ))
+                jids.len()
+            )),
+        )
     }
 
     /// One claim-probe-fetch pass. Returns the jids whose in-flight leader

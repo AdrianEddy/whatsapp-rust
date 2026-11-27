@@ -259,14 +259,10 @@ impl Client {
         // deactivated while we waited for the permit.
         let drain_active = self.inbound_commit_batch.is_active();
         if drain_active && let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-            return if client
-                .flush_inbound_commits_under_permit(false, None, None)
+            return client
+                .flush_inbound_commits_under_permit_result(false, None, None)
                 .await
-            {
-                Ok(())
-            } else {
-                Err(SignalMaintenanceError::DrainCommitFailed)
-            };
+                .map_err(SignalMaintenanceError::DrainCommitFailed);
         } else if drain_active {
             // Drain active but no live client to route the permit-held flush
             // through (practically unreachable — the run loop holds a strong

@@ -158,10 +158,10 @@ fn ensure_adv_bootstrap_scope(
     expected: u64,
     shutdown: &wacore::runtime::ShutdownSignal,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !shutdown.is_fired() && generation.load(Ordering::Acquire) == expected,
-        "connection changed during ADV bootstrap"
-    );
+    if shutdown.is_fired() || generation.load(Ordering::Acquire) != expected {
+        return Err(anyhow::Error::new(crate::client::ClientError::NotConnected)
+            .context("connection changed during ADV bootstrap"));
+    }
     Ok(())
 }
 
@@ -418,7 +418,7 @@ impl Client {
                     )
                     .await?
                 {
-                    anyhow::bail!("primary identity changed during companion bootstrap");
+                    return Err(crate::client::ConcurrentChange::PrimaryIdentity.into());
                 }
             }
         }
@@ -538,7 +538,8 @@ impl Client {
         };
         futures::select_biased! {
             _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
-                anyhow::bail!("connection closed during ADV bootstrap")
+                Err(anyhow::Error::new(crate::client::ClientError::NotConnected)
+                    .context("connection closed during ADV bootstrap"))
             },
             result = Box::pin(bootstrap).fuse() => result,
         }
@@ -1407,6 +1408,11 @@ impl Client {
         Ok(())
     }
 }
+
+// WF25: the ADV bootstrap's connection ends, typed.
+#[cfg(test)]
+#[path = "prekeys/mc_tests.rs"]
+mod mc_tests;
 
 #[cfg(test)]
 #[path = "prekeys/adv_bootstrap_tests.rs"]

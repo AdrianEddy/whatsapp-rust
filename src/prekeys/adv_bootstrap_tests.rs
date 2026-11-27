@@ -508,7 +508,25 @@ async fn adv_bootstrap_rechecks_current_trust_and_connection_before_publication(
             .await
             .unwrap();
         if retire_connection || fire_shutdown {
-            assert!(result.is_err());
+            let error = result.unwrap_err();
+            // WF25: the connection's end, read by type. A shutdown ends the
+            // bootstrap at its `select_biased!` arm, a retired connection at
+            // the scope's check.
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::client::ClientError>(),
+                    Some(crate::client::ClientError::NotConnected)
+                ),
+                "{error:#}"
+            );
+            assert_eq!(
+                error.to_string(),
+                if fire_shutdown {
+                    "connection closed during ADV bootstrap"
+                } else {
+                    "connection changed during ADV bootstrap"
+                }
+            );
             assert!(persisted.is_none());
         } else {
             assert_eq!(result.unwrap(), *current.public_key.public_key_bytes());

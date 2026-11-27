@@ -88,15 +88,48 @@ async fn cold_group_registry_progress_preserves_current_devices_and_strict_refre
                     assert_eq!(requests, if complete_fill { 1 } else { 2 });
                 }
                 crate::cache::Freshness::Refresh => {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("device registry kept changing")
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains("device registry kept changing"));
+                    // WF25: a race the caller reads by type, and retries.
+                    assert_eq!(
+                        error.downcast_ref::<crate::client::ConcurrentChange>(),
+                        Some(&crate::client::ConcurrentChange::GroupDeviceRefresh),
+                        "{error:#}"
                     );
                     assert_eq!(requests, DEVICE_REFRESH_MAX_ATTEMPTS);
                 }
             }
         }
     }
+}
+
+/// WF25: an authoritative refresh whose device registry changes under every
+/// attempt gives up as the race a caller reads by type, and retries.
+#[tokio::test]
+async fn an_authoritative_refresh_the_registry_keeps_changing_under_is_a_concurrent_change() {
+    let (client, transport) = create_iq_test_client().await;
+    let user = Jid::pn("12025550133");
+    seed_adv_primary(&client, &user).await;
+    let refresh = tokio::spawn({
+        let client = client.clone();
+        let user = user.clone();
+        async move { client.refresh_user_devices(vec![user]).await }
+    });
+    for request in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+        let iq = decode_sent_iq(&transport, request).await;
+        // A publication for the user lands while its IQ is in flight, so the
+        // reply's application is fenced and the refresh asks again.
+        client.device_topology.record([user.user.as_str()]);
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let reply = adv_wire_response(&user, signed_key_index_bytes(vec![1], 1));
+        answer_iq(&client, &id, &reply).await;
+    }
+    let error = refresh.await.unwrap().unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::client::ConcurrentChange>(),
+        Some(&crate::client::ConcurrentChange::DeviceRefresh),
+        "{error:#}"
+    );
+    assert_eq!(transport.sent().len(), DEVICE_REFRESH_MAX_ATTEMPTS);
+    client.signal_shutdown_sync();
 }

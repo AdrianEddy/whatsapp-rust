@@ -496,9 +496,9 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
-    DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
-    SecretFlushReport, ShutdownReport, SignalMaintenanceError,
+    ConcurrentChange, ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome,
+    DeregistrationSkipReason, DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability,
+    RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use client::{NodeFilter, NodeWaiter};
 pub use types::app_state_durability::{AppStateBatch, AppStateBatchKind, AppStateDurabilityHook};

@@ -4,6 +4,9 @@
 //! [`ProbeBackend`], which logs every store call it forwards to an
 //! [`InMemoryBackend`] the test also reads directly; that backend implements
 //! the single-row methods only, so the batched calls run the trait's defaults.
+//!
+//! WF25 at the end: a send's flush during the drain whose commit fails says
+//! why, as `SignalMaintenanceError::DrainCommitFailed`'s source.
 
 use super::*;
 use crate::message::tests::{delivery_receipts_for, seed_test_pn};
@@ -531,5 +534,37 @@ async fn cleanup_keeps_owed_report_in_one_batched_replace() {
     assert!(
         journal.occurrences.is_empty(),
         "what the batch committed is gone from the row"
+    );
+}
+
+/// The drain's commit under a send's batch-safe flush fails: the error carries
+/// the commit's own failure as its source, which a caller reads through the
+/// chain (here the test's injected one; a store's error and the host's inside
+/// it otherwise).
+#[tokio::test]
+async fn a_drain_commit_failure_keeps_its_cause() {
+    let client = crate::test_utils::create_test_client_with_failing_http("wf25_drain_cause").await;
+    client.inbound_commit_batch.reset();
+    client.swap_message_semaphore(1);
+    client
+        .commit_or_batch_inbound(item("WF25_DRAIN"), false)
+        .await;
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    let error = client
+        .flush_signal_cache_batch_safe()
+        .await
+        .expect_err("the drain's commit fails");
+    let crate::client::SignalMaintenanceError::DrainCommitFailed(cause) = &error else {
+        panic!("not the drain's commit: {error:?}");
+    };
+    assert_eq!(cause.to_string(), "a test's injected commit failure");
+    let source = std::error::Error::source(&error).expect("the commit's failure is the source");
+    assert_eq!(source.to_string(), "a test's injected commit failure");
+    assert!(
+        client.inbound_commit_batch.has_entries(),
+        "the failed batch stays for the next flush"
     );
 }

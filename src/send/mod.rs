@@ -3044,7 +3044,8 @@ impl Client {
                 .load(std::sync::atomic::Ordering::Acquire)
                 != send_generation
         {
-            anyhow::bail!("connection changed while preparing group message");
+            return Err(anyhow::Error::new(ClientError::NotConnected)
+                .context("connection changed while preparing group message"));
         }
         let awaiting_history_ack = history_expected_phash.is_some();
         if let Some(slot) = history_expected_phash {

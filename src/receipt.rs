@@ -1210,7 +1210,7 @@ impl Client {
             );
             self.send_node(node)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))?;
+                .map_err(|e| anyhow::Error::new(e).context("Failed to send read receipt"))?;
         }
         Ok(())
     }
@@ -1248,11 +1248,16 @@ impl Client {
                 build_played_receipt_node(chat, sender, chunk, &timestamp, read_receipts_disabled);
             self.send_node(node)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))?;
+                .map_err(|e| anyhow::Error::new(e).context("Failed to send played receipt"))?;
         }
         Ok(())
     }
 }
+
+// WF25: a receipt's write keeps its error.
+#[cfg(test)]
+#[path = "receipt/mc_tests.rs"]
+mod mc_tests;
 
 #[cfg(test)]
 mod tests {

@@ -634,7 +634,7 @@ impl Client {
                 pending = Some(missing);
             }
         }
-        anyhow::bail!("device registry kept changing while a group refresh was in flight")
+        Err(crate::client::ConcurrentChange::GroupDeviceRefresh.into())
     }
 
     /// Recover rotated contacts individually before the group topology CAS.
@@ -1103,9 +1103,7 @@ impl Client {
                 }
 
                 if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
-                    anyhow::bail!(
-                        "device registry kept changing while an authoritative refresh was in flight"
-                    );
+                    return Err(crate::client::ConcurrentChange::DeviceRefresh.into());
                 }
 
                 // The complete response contains every requested identity. Move its
@@ -2298,7 +2296,7 @@ impl Client {
                         user,
                         alias.as_ref()
                     )),
-                    "account alias changed during ADV recovery"
+                    crate::client::ConcurrentChange::AccountAlias
                 );
                 addresses.extend(alias.iter().map(wacore::types::jid::adv_account_jid));
                 aliases.push(alias);
@@ -2316,7 +2314,7 @@ impl Client {
                         user,
                         current.as_ref()
                     )),
-                    "account alias changed during ADV recovery"
+                    crate::client::ConcurrentChange::AccountAlias
                 );
                 unchanged &= current == *alias;
             }
@@ -2324,7 +2322,10 @@ impl Client {
                 return Ok((sessions, mapping));
             }
         }
-        anyhow::bail!("account aliases changed during ADV lock acquisition")
+        Err(
+            anyhow::Error::new(crate::client::ConcurrentChange::AccountAlias)
+                .context("account aliases changed during ADV lock acquisition"),
+        )
     }
 
     /// Only a known reciprocal alias can carry the same trusted primary across
